@@ -689,6 +689,9 @@ pub struct EventBridge {
     web_delivery: OrderedWebDelivery,
     tools: Arc<Mutex<HashMap<String, ToolCall>>>,
     timeline_writer: Arc<Mutex<TimelineWriter>>,
+    /// Agent 侧活动时钟（见 [`super::stall`]）：入站通知、权限/询问请求与
+    /// prompt 响应会推进它，回合静默看门狗据此判断 Agent 是否还在动。
+    activity: super::stall::ActivityClock,
 }
 
 #[derive(Clone)]
@@ -757,11 +760,51 @@ impl EventBridge {
             web_delivery: OrderedWebDelivery::new(last_seq),
             tools: Arc::new(Mutex::new(HashMap::new())),
             timeline_writer,
+            activity: super::stall::new_activity_clock(),
         }
     }
 
     pub fn pinvou_session_id(&self) -> &str {
         &self.pinvou_session_id
+    }
+
+    /// 会话活动时钟句柄（与 [`super::stall::ActivityClock`] 共享同一个计数器）。
+    pub fn activity(&self) -> super::stall::ActivityClock {
+        self.activity.clone()
+    }
+
+    /// 当前回合 id（回合收口方用于认领，见 [`EventBridge::finish_turn_once`]）。
+    pub fn current_turn_id(&self) -> Option<String> {
+        self.current_turn.read().clone()
+    }
+
+    /// 记录一次 Agent 侧活动（入站通知、权限/询问请求、prompt 响应）。
+    pub fn note_agent_activity(&self) {
+        super::stall::mark_activity(&self.activity);
+    }
+
+    /// 幂等收口：只在该回合仍被本 bridge 认领时发出 `turn_completed`。
+    ///
+    /// prompt 响应返回与看门狗本地收口是两条独立路径，晚到的一方必须让位，
+    /// 否则同一回合会写出第二个 `turn_completed`（前端会多渲染一次结束态）。
+    pub fn finish_turn_once(
+        &self,
+        turn_id: &str,
+        status: &str,
+        error: Option<&str>,
+        recovery_reason: Option<&str>,
+    ) -> bool {
+        if !super::stall::claim_current_turn(&self.current_turn, turn_id) {
+            return false;
+        }
+        let mut data = json!({ "status": status, "error": error });
+        if let Some(reason) = recovery_reason {
+            if let Value::Object(map) = &mut data {
+                map.insert("recoveryReason".to_string(), json!(reason));
+            }
+        }
+        self.emit_with_turn(Some(turn_id.to_string()), "turn_completed", data);
+        true
     }
 
     pub fn begin_turn(&self, content: &str, attachments: &[CodexDisplayAttachment]) -> String {
@@ -837,6 +880,8 @@ impl EventBridge {
     }
 
     pub fn handle(&self, notification: SessionNotification) {
+        // Agent 每推送一条会话更新都算「还活着」，供回合静默看门狗使用。
+        self.note_agent_activity();
         let meta = serde_json::to_value(notification.meta).unwrap_or(Value::Null);
         match notification.update {
             SessionUpdate::UserMessageChunk(chunk) => {

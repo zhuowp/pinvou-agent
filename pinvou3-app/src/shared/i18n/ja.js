@@ -127,6 +127,12 @@ const codexJa = {
   accountRecoveryHint:'現在のアカウントは期限切れ、または利用枠不足の可能性があります。アカウントを切り替えても既存のセッションとメッセージは保持されます。',
   serviceRecoveryHint:'サービス状態を再確認してください。問題が続く場合は、後でもう一度試すかアカウントを切り替えてください。',
   errorDetails:'エラー詳細を表示', dismissNotice:'閉じる',
+  agentUnresponsive:agent=>`${agent} が応答しなくなっています`,
+  agentStderr:agent=>`${agent} が問題を報告しました`,
+  agentStallHint:'このターンはまだ新しいイベントがありません。待機を続けるか、「停止」で切り上げられます。',
+  agentStallSettledHint:'Agent が長時間応答しなかったため、このターンは中断として切り上げました。再送信するか、そのまま続けられます。',
+  agentCancelTimeoutHint:'「停止」に Agent から応答がなかったため、このターンは中断として切り上げました。',
+  agentStderrHint:'Agent アダプターからのエラー原文です（セッションログにも記録されます）。',
   runtimeSources:{ system:'システム CLI', override:'カスタム CLI', bundled:'内蔵 Bridge', legacy_bundled:'内蔵 Codex' },
 };
 

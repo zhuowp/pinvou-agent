@@ -18,6 +18,7 @@ mod platform;
 mod providers;
 pub(crate) mod reader_window;
 mod runtime;
+mod stall;
 mod store;
 pub(crate) mod workspace;
 
@@ -43,7 +44,7 @@ use agent_client_protocol::schema::v1::{
     CancelNotification, ClientCapabilities, ContentBlock, CreateElicitationRequest,
     CreateElicitationResponse, ElicitationAcceptAction, ElicitationAction, ElicitationCapabilities,
     ElicitationContentValue, ElicitationFormCapabilities, Implementation, InitializeRequest,
-    LoadSessionRequest, NewSessionRequest, PromptCapabilities, PromptRequest,
+    LoadSessionRequest, NewSessionRequest, PromptCapabilities, PromptRequest, PromptResponse,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption, SessionConfigSelectOptions,
     SessionModeState, SessionNotification, SetSessionConfigOptionRequest, SetSessionModeRequest,
@@ -746,6 +747,13 @@ struct AcpSession {
     /// 最近一次请求/响应时刻（空闲回收巡检用）。任何直接到达该会话的请求
     /// （发消息、改配置、状态查询复用）与 prompt 响应返回都会刷新。
     last_activity: parking_lot::Mutex<Instant>,
+    /// Agent 侧活动时钟（与 event bridge 共享）：回合静默看门狗据此判断
+    /// 「Agent 是否还在动」，与上面的空闲回收时钟刻意分开。
+    activity: stall::ActivityClock,
+    /// 会话级待决权限/询问表（与池共享同一个 map）：用户正在被询问时，
+    /// 静默属于人的思考时间，看门狗不得据此判定 Agent 卡死。
+    pending_permissions: Arc<Mutex<HashMap<String, PendingPermission>>>,
+    pending_elicitations: Arc<Mutex<HashMap<String, PendingElicitation>>>,
 }
 
 impl AcpSession {
@@ -780,15 +788,13 @@ impl AcpSession {
         attachments: Vec<CodexDisplayAttachment>,
     ) -> bool {
         let turn_id = self.bridge.begin_turn(&content, &attachments);
+        // prompt 发出即从这一刻起算静默：看门狗只认 Agent 侧的后续活动。
+        stall::mark_activity(&self.activity);
         let kimi_diagnostic_cursor = match self.kimi_session_id.as_deref() {
             Some(session_id) => Some(kimi_diagnostic_cursor(session_id).await),
             None => None,
         };
-        let result = self
-            .connection
-            .send_request(PromptRequest::new(self.acp_session_id.clone(), blocks))
-            .block_task()
-            .await;
+        let result = self.await_prompt_with_stall_guard(&turn_id, blocks).await;
         self.busy.store(false, Ordering::Release);
         // 响应返回也算一次活动：长时间流式输出的 turn 结束后重新计空闲。
         self.note_activity();
@@ -806,7 +812,8 @@ impl AcpSession {
                         "Failed",
                         Some(&error),
                     );
-                    self.bridge.finish_turn(&turn_id, "Failed", Some(&error));
+                    self.bridge
+                        .finish_turn_once(&turn_id, "Failed", Some(&error), None);
                     return false;
                 }
                 let status = match response.stop_reason {
@@ -821,7 +828,8 @@ impl AcpSession {
                     status,
                     None,
                 );
-                self.bridge.finish_turn(&turn_id, status, None);
+                // 看门狗可能已把该回合本地收口（Agent 长时间无响应）：此时不再补发。
+                self.bridge.finish_turn_once(&turn_id, status, None, None);
                 false
             }
             Err(error) => {
@@ -832,10 +840,95 @@ impl AcpSession {
                     "Failed",
                     Some(&message),
                 );
-                self.bridge.finish_turn(&turn_id, "Failed", Some(&message));
+                self.bridge
+                    .finish_turn_once(&turn_id, "Failed", Some(&message), None);
                 upgrade_required
             }
         }
+    }
+
+    /// 等待 `session/prompt` 响应，并兜底「Agent 不回响应」。
+    ///
+    /// 宿主只认这条响应来结束回合；上游适配器在「后台任务通知自启回合 +
+    /// 宿主 prompt 被 `absorbed_mid_turn` 吸收」时会漏掉它（见
+    /// `agentclientprotocol/claude-agent-acp#896` 等），届时界面会永久停在
+    /// 「处理中」，只有重启应用才会被孤儿回合收口。这里按静默分级兜底：
+    /// 超阈值先提示、再请求取消、宽限期后本地收口；SDK 请求本身始终继续等待
+    /// （丢弃它会让 ACP 请求被取消，反而制造 "response never received" 噪音）。
+    async fn await_prompt_with_stall_guard(
+        &self,
+        turn_id: &str,
+        blocks: Vec<ContentBlock>,
+    ) -> std::result::Result<PromptResponse, agent_client_protocol::Error> {
+        let request = self
+            .connection
+            .send_request(PromptRequest::new(self.acp_session_id.clone(), blocks));
+        let mut request = std::pin::pin!(request.block_task());
+        let mut ticker = tokio::time::interval(stall::STALL_TICK);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut noticed = false;
+        let mut cancel_sent_at: Option<Instant> = None;
+        let mut settled = false;
+        loop {
+            tokio::select! {
+                result = &mut request => return result,
+                _ = ticker.tick() => {
+                    if settled || self.awaiting_user_decision().await {
+                        // 已本地收口，或用户正在被询问（静默是人的时间）。
+                        continue;
+                    }
+                    let quiet = stall::quiet_for(&self.activity);
+                    match stall::stall_step(quiet, noticed, cancel_sent_at.map(|at| at.elapsed())) {
+                        stall::StallStep::Idle => {}
+                        stall::StallStep::Notice => {
+                            noticed = true;
+                            self.bridge.emit(
+                                "runtime_notice",
+                                json!({ "kind": "agent_stall", "quietSeconds": quiet.as_secs() }),
+                            );
+                        }
+                        stall::StallStep::Cancel => {
+                            cancel_sent_at = Some(Instant::now());
+                            self.cancel();
+                            self.bridge.emit("runtime_notice", json!({ "kind": "agent_stall_cancel" }));
+                        }
+                        stall::StallStep::Settle => {
+                            settled = true;
+                            self.bridge.finish_turn_once(
+                                turn_id,
+                                "Interrupted",
+                                None,
+                                Some("agent_stall_timeout"),
+                            );
+                            // 让界面回到空闲：Agent 已经不再回答这个回合，继续
+                            // 显示「处理中」只会让用户以为还能等。
+                            self.busy.store(false, Ordering::Release);
+                            self.bridge.emit("runtime_notice", json!({ "kind": "agent_stall_settled" }));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// 是否有等待用户决定的权限/询问卡片。等待期间没有 Agent 事件属于正常：
+    /// 那是人在读卡片，不是 Agent 卡死。
+    async fn awaiting_user_decision(&self) -> bool {
+        let session_id = self.bridge.pinvou_session_id();
+        if self
+            .pending_permissions
+            .lock()
+            .await
+            .values()
+            .any(|pending| pending.view.session_id == session_id)
+        {
+            return true;
+        }
+        self.pending_elicitations
+            .lock()
+            .await
+            .values()
+            .any(|pending| pending.view.session_id == session_id)
     }
 
     fn bridge_session_id(&self) -> String {
@@ -3136,6 +3229,10 @@ impl AcpPool {
                     runtime
                         .bridge
                         .emit("cancel_requested", json!({ "status": "cancelling" }));
+                    // 停止不能无限期依赖 Agent 应答：上游在丢弃/吸收 prompt 时
+                    // 可能永不回应，用户会以为停止按钮失灵（现场见到连点四次、
+                    // 约 30 秒后才被适配器自己的 cancel floor 收口）。
+                    Self::schedule_cancel_settle(session_id.to_string(), runtime.clone());
                 } else {
                     // session 已恢复但当前进程没有活跃 prompt 时，session/cancel 无法
                     // 命中旧进程的 turn。直接收口持久化孤儿回合，让停止操作可恢复且幂等。
@@ -3151,6 +3248,42 @@ impl AcpPool {
                     .interrupt_orphaned_turns("cancel_without_runtime");
             }
         }
+    }
+
+    /// 用户停止后的兜底收口：宽限期内 Agent 没有给出响应就本地收口。
+    fn schedule_cancel_settle(session_id: String, runtime: Arc<AcpSession>) {
+        tokio::spawn(async move {
+            let deadline = Instant::now() + stall::CANCEL_SETTLE_GRACE;
+            while Instant::now() < deadline {
+                if !runtime.busy.load(Ordering::Acquire) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            if !runtime.busy.load(Ordering::Acquire) {
+                return;
+            }
+            if let Some(turn_id) = runtime.bridge.current_turn_id() {
+                runtime.bridge.finish_turn_once(
+                    &turn_id,
+                    "Interrupted",
+                    None,
+                    Some("cancel_timeout"),
+                );
+            }
+            runtime.busy.store(false, Ordering::Release);
+            runtime
+                .bridge
+                .emit("runtime_notice", json!({ "kind": "cancel_timeout" }));
+            diagnostics::write(
+                &diagnostics::operation_id("cancel-settle"),
+                "session:cancel_timeout",
+                format!(
+                    "session_id={session_id} grace_secs={}",
+                    stall::CANCEL_SETTLE_GRACE.as_secs()
+                ),
+            );
+        });
     }
 
     pub async fn evict(&self, session_id: &str) {
@@ -3778,14 +3911,17 @@ impl AcpPool {
             .with_context(|| format!("启动 {} 失败", backend.display_name()))?;
         let stdin = child.stdin.take().context("ACP stdin 不可用")?;
         let stdout = child.stdout.take().context("ACP stdout 不可用")?;
+        let event_bridge = EventBridge::new(self.app.clone(), pinvou_session_id.to_string());
         let stderr_tail = Arc::new(parking_lot::Mutex::new(VecDeque::<String>::new()));
         if let Some(stderr) = child.stderr.take() {
             let sid = pinvou_session_id.to_string();
             let operation_id = operation_id.to_string();
             let stderr_tail = stderr_tail.clone();
             let agent_id = backend.agent_id().unwrap_or("acp");
+            let notice_bridge = event_bridge.clone();
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
+                let mut last_notice: Option<Instant> = None;
                 while let Ok(Some(line)) = lines.next_line().await {
                     {
                         let mut tail = stderr_tail.lock();
@@ -3799,11 +3935,26 @@ impl AcpPool {
                         "session:bridge_stderr",
                         format!("agent={agent_id} session_id={sid} stderr={line}"),
                     );
+                    // 适配器把真正的异常写进 stderr（例如「cancel floor … wedged」），
+                    // 只落盘不够：用户看不到，只能对着永久转圈的界面猜。命中稳定
+                    // 措辞时透出一份（原文截断、限频），由前端提示。
+                    let throttled = last_notice
+                        .is_some_and(|at| at.elapsed() < stall::STDERR_NOTICE_MIN_INTERVAL);
+                    if !throttled && stall::stderr_notice_worthy(&line) {
+                        last_notice = Some(Instant::now());
+                        notice_bridge.emit(
+                            "runtime_notice",
+                            json!({
+                                "kind": "agent_stderr",
+                                "agent": agent_id,
+                                "detail": line.chars().take(stall::STDERR_NOTICE_MAX_CHARS).collect::<String>(),
+                            }),
+                        );
+                    }
                 }
             });
         }
 
-        let event_bridge = EventBridge::new(self.app.clone(), pinvou_session_id.to_string());
         let replay_suppressed = Arc::new(AtomicBool::new(false));
         let (ready_tx, ready_rx) = oneshot::channel();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -3863,6 +4014,8 @@ impl AcpPool {
                                 "request": request_value,
                             }),
                         );
+                        // 权限请求是 Agent 侧活动：看门狗据此外推静默窗口。
+                        bridge_for_permission.note_agent_activity();
                         let response = response_rx.await.unwrap_or_else(|_| {
                             RequestPermissionResponse::new(RequestPermissionOutcome::Cancelled)
                         });
@@ -3895,6 +4048,7 @@ impl AcpPool {
                                 "request": request_value,
                             }),
                         );
+                        bridge_for_elicitation.note_agent_activity();
                         let (response, cancelled_by_agent) = tokio::select! {
                             response = response_rx => (
                                 response.unwrap_or_else(|_| {
@@ -4074,11 +4228,17 @@ impl AcpPool {
             }),
         );
 
+        let activity = event_bridge.activity();
+        let pending_permissions = self.pending_permissions.clone();
+        let pending_elicitations = self.pending_elicitations.clone();
         Ok(AcpSession {
             connection,
             kimi_session_id: (backend == AgentBackend::KimiAcp).then(|| acp_session_id.clone()),
             acp_session_id,
             bridge: event_bridge,
+            activity,
+            pending_permissions,
+            pending_elicitations,
             busy: AtomicBool::new(false),
             configuring: AtomicBool::new(false),
             prompt_pending: AtomicUsize::new(0),

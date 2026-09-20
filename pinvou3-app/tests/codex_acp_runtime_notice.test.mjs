@@ -7,6 +7,7 @@ const stateModule = await import(`data:text/javascript;base64,${Buffer.from(stat
 const {
   classifyAcpServiceFailure,
   isAcpAuthenticationFailure,
+  latestAgentRuntimeNotice,
   runtimeInstallInProgress,
   runtimeLoginInProgress,
   runtimeNoticeMode,
@@ -229,5 +230,61 @@ assert.doesNotMatch(
   'unrelated work must not render the active Agent as logging in',
 );
 assert.doesNotMatch(notices, /managed_download|managedDownload|downloadManaged/);
+
+// Agent 侧运行时提示：适配器 stderr 与回合看门狗的兜底动作都必须能浮到界面，
+// 并在用户发出下一条消息后自动过期。
+const envelope = (seq, type, data) => ({ seq, timestamp: `t${seq}`, event: { type, data } });
+assert.equal(latestAgentRuntimeNotice([]), null, 'no events means no notice');
+assert.equal(
+  latestAgentRuntimeNotice([envelope(1, 'turn_started', {})]),
+  null,
+  'a plain turn start is not a notice',
+);
+const stderrNotice = latestAgentRuntimeNotice([
+  envelope(1, 'turn_started', {}),
+  envelope(2, 'runtime_notice', {
+    kind: 'agent_stderr',
+    agent: 'claude',
+    detail: 'cancel floor elapsed without the SDK yielding',
+  }),
+]);
+assert.equal(stderrNotice?.kind, 'agent_stderr');
+assert.equal(stderrNotice?.agent, 'claude');
+assert.equal(stderrNotice?.detail, 'cancel floor elapsed without the SDK yielding');
+assert.equal(
+  latestAgentRuntimeNotice([
+    envelope(1, 'runtime_notice', { kind: 'agent_stall', quietSeconds: 200 }),
+    envelope(2, 'runtime_notice', { kind: 'not_a_known_kind' }),
+  ])?.kind,
+  'agent_stall',
+  'unknown notice kinds must not surface',
+);
+assert.equal(
+  latestAgentRuntimeNotice([
+    envelope(1, 'runtime_notice', { kind: 'agent_stall_settled' }),
+    envelope(2, 'turn_started', {}),
+  ]),
+  null,
+  'a newer user turn expires the notice',
+);
+assert.equal(
+  latestAgentRuntimeNotice([
+    envelope(1, 'turn_started', {}),
+    envelope(2, 'runtime_notice', { kind: 'cancel_timeout' }),
+    envelope(3, 'turn_completed', { status: 'Interrupted' }),
+  ])?.kind,
+  'cancel_timeout',
+  'the notice survives its own turn completion so the ending stays explained',
+);
+assert.match(
+  notices,
+  /data-testid="acp-agent-runtime-notice"/,
+  'the ACP notices module must render the agent runtime notice',
+);
+assert.match(
+  view,
+  /latestAgentRuntimeNotice\(events\)/,
+  'the ACP view must derive the notice from the event stream',
+);
 
 console.log('✓ ACP runtime notice state matrix passed');

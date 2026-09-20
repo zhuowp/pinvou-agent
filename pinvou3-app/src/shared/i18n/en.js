@@ -127,6 +127,12 @@ const codexEn = {
   accountRecoveryHint:'This account may be expired or out of quota. Switch accounts to continue; existing sessions and messages are preserved.',
   serviceRecoveryHint:'Check the service again. If the issue continues, retry later or switch accounts.',
   errorDetails:'View error details', dismissNotice:'Dismiss',
+  agentUnresponsive:agent=>`${agent} has stopped responding`,
+  agentStderr:agent=>`${agent} reported a problem`,
+  agentStallHint:'No new events in this turn yet. You can keep waiting, or press Stop to settle it.',
+  agentStallSettledHint:'The agent stopped responding for too long, so this turn was settled as interrupted. You can send again or continue.',
+  agentCancelTimeoutHint:'Stop was not acknowledged by the agent, so this turn was settled as interrupted.',
+  agentStderrHint:'Raw error text from the agent adapter (also recorded in the session log).',
   runtimeSources:{ system:'System CLI', override:'Custom CLI', bundled:'Bundled bridge', legacy_bundled:'Bundled Codex' },
 };
 

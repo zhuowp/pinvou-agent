@@ -52,3 +52,43 @@ export function classifyAcpServiceFailure(envelope) {
     key: `${envelope.seq || ''}:${envelope.timestamp || ''}:${detail}`,
   };
 }
+
+// Agent 侧运行时提示：适配器自己的报错原文，以及宿主回合看门狗的兜底动作。
+// 它们不是「模型服务故障」，要表达的是「知情 + 可以继续」，因此单独一层。
+const AGENT_RUNTIME_NOTICE_KINDS = new Set([
+  'agent_stderr',
+  'agent_stall',
+  'agent_stall_cancel',
+  'agent_stall_settled',
+  'cancel_timeout',
+]);
+
+/**
+ * 最近一条 Agent 侧运行时提示；用户发出下一条消息（更新的 turn_started）
+ * 之后视为过期，避免旧提示跟着整段会话。
+ */
+export function latestAgentRuntimeNotice(events) {
+  if (!Array.isArray(events)) return null;
+  let notice = null;
+  for (const envelope of events) {
+    const type = envelope?.event?.type;
+    if (type === 'runtime_notice') {
+      const kind = String(envelope?.event?.data?.kind || '');
+      if (AGENT_RUNTIME_NOTICE_KINDS.has(kind)) notice = envelope;
+      continue;
+    }
+    if (type === 'turn_started' && notice
+      && Number(envelope.seq || 0) > Number(notice.seq || 0)) {
+      notice = null;
+    }
+  }
+  if (!notice) return null;
+  const data = notice.event.data || {};
+  return {
+    kind: String(data.kind || ''),
+    agent: String(data.agent || ''),
+    detail: String(data.detail || ''),
+    quietSeconds: Number(data.quietSeconds || 0),
+    key: `${notice.seq || ''}:${notice.timestamp || ''}`,
+  };
+}
