@@ -133,7 +133,7 @@ const codexZh = {
   agentCancelTimeoutHint:'「停止」没有得到 Agent 回应，本轮已按中断收尾。',
   agentStderrHint:'来自 Agent 适配器的报错原文（会话日志里也有记录）。',
   agentRestarted:agent=>`${agent} 会话已重启`,
-  agentStallRestartHint:'同一会话在短时间内反复无响应，下一条消息会换一个全新的 Agent 会话继续（会话历史保留）。',
+  agentStallRestartHint:'同一会话在短时间内反复无响应，下一条消息会换一个全新的 Agent 会话继续；能否带上前面的对话取决于该 Agent 的恢复能力，切换后我们会再告知一次。',
   agentRestartHint:'上一个 Agent 会话反复无响应，已换用新会话继续；会话历史保留，未完成的回合需要重新发送。',
   agentRestartFreshHint:'上一个 Agent 会话反复无响应，已换用新会话继续；该 Agent 没能恢复此前的对话，请把需要的上下文重新说明，未完成的回合需要重新发送。',
   runtimeSources:{ system:'系统 CLI', override:'自定义 CLI', bundled:'内置 Bridge', legacy_bundled:'内置 Codex' },

@@ -134,7 +134,7 @@ const codexJa = {
   agentCancelTimeoutHint:'「停止」に Agent から応答がなかったため、このターンは中断として切り上げました。',
   agentStderrHint:'Agent アダプターからのエラー原文です（セッションログにも記録されます）。',
   agentRestarted:agent=>`${agent} のセッションを再起動しました`,
-  agentStallRestartHint:'同じセッションが短時間に繰り返し応答しなくなったため、次のメッセージは新しい Agent セッションで続行します（会話履歴は保持されます）。',
+  agentStallRestartHint:'同じセッションが短時間に繰り返し応答しなくなったため、次のメッセージは新しい Agent セッションで続行します。以前の会話を引き継げるかはその Agent の復元機能によります。切り替え後にどちらになったかをお知らせします。',
   agentRestartHint:'以前の Agent セッションが繰り返し応答しなくなったため、新しいセッションで続行しました。会話履歴は保持されますが、未完了のターンは再送信が必要です。',
   agentRestartFreshHint:'以前の Agent セッションが繰り返し応答しなくなったため、新しいセッションで続行しました。この Agent は以前の会話を復元できませんでした。必要な文脈はもう一度お伝えください。未完了のターンは再送信が必要です。',
   runtimeSources:{ system:'システム CLI', override:'カスタム CLI', bundled:'内蔵 Bridge', legacy_bundled:'内蔵 Codex' },
