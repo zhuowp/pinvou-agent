@@ -42,7 +42,12 @@ pub(super) const STDERR_NOTICE_MIN_INTERVAL: Duration = Duration::from_secs(30);
 pub(super) const STDERR_NOTICE_MAX_CHARS: usize = 400;
 /// 同一会话反复卡死的判定窗口：窗口内第 `STALL_RESTART_AFTER` 次本地收口
 /// 才升级为重启 Agent 会话。
-pub(super) const STALL_RESTART_WINDOW: Duration = Duration::from_secs(600);
+///
+/// 必须**大于一次 stall 收口的最短周期**（`STALL_CANCEL_AFTER` +
+/// `CANCEL_SETTLE_GRACE` ≈ 31 分钟），否则两次真实的反复卡死永远落不进同一个
+/// 窗口，升级路径就成了死代码。取 1 小时：既能覆盖「同一个坏会话连续卡两次」，
+/// 又能在过了一小时之后把上一次当作陈旧记录不再计数。
+pub(super) const STALL_RESTART_WINDOW: Duration = Duration::from_secs(3600);
 pub(super) const STALL_RESTART_AFTER: usize = 2;
 
 /// Agent 侧活动时钟（epoch 毫秒）。只记录 Agent 的活动：入站通知、权限/询问
@@ -339,6 +344,20 @@ mod tests {
         assert!(
             !tracker.record(base + STALL_RESTART_WINDOW + Duration::from_secs(1)),
             "窗口外的旧收口不再计数"
+        );
+    }
+
+    /// 升级窗口必须容得下一次真实的反复卡死，否则重启路径永远不会触发。
+    #[test]
+    fn forkguard_stall_restart_window_covers_a_full_stall_cycle() {
+        let mut tracker = StallSettleTracker::new();
+        let first = Instant::now();
+        assert!(!tracker.record(first));
+        // 第二次卡死最早出现在「第一次收口 + 取消宽限」之后。
+        let second = first + STALL_CANCEL_AFTER + CANCEL_SETTLE_GRACE;
+        assert!(
+            tracker.record(second),
+            "两次连续 stall 收口必须落在同一个窗口内，否则升级路径不可达"
         );
     }
 }
