@@ -303,7 +303,7 @@ assert.match(
   /latestAgentRuntimeNotice\(events\)/,
   'the ACP view must derive the notice from the event stream',
 );
-for (const kind of ['agent_stall_restart', 'agent_session_restarted']) {
+for (const kind of ['agent_stall_restart', 'agent_session_restarted', 'agent_session_restarted_fresh']) {
   assert.equal(
     latestAgentRuntimeNotice([envelope(1, 'runtime_notice', { kind })])?.kind,
     kind,

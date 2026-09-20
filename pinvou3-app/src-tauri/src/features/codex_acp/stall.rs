@@ -6,8 +6,13 @@
 //! prompt 被 `absorbed_mid_turn` 吸收」的情况下确实会漏掉这条响应
 //! （agentclientprotocol/claude-agent-acp#896/#1027/#1039/#1114）。
 //!
-//! 本模块只提供判定：活动时钟、静默分级、回合认领与 stderr 提示筛选；
-//! 实际动作（提示、请求取消、本地收口）由调用方执行，二者都可单测。
+//! 本模块只提供判定：活动时钟、静默分级、回合认领、stderr 提示闸门与
+//! 「反复卡死才重启」的计数器；实际动作（提示、请求取消、本地收口、重启
+//! 运行时）由调用方执行。
+//!
+//! 作用域：这套看门狗挂在共享的 ACP 会话运行时上，因此对 Codex、Claude Code
+//! 与 Kimi 三个适配器一视同仁；只是**阈值**参照 Claude 家族的实测（cancel floor
+//! 约 30 秒、事件间隔秒级到分钟级）取值，换适配器时按同一口径重新标定即可。
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -21,7 +26,14 @@ pub(super) const STALL_TICK: Duration = Duration::from_secs(15);
 /// 静默多久先提示用户。Agent 长时间思考不产生事件，只有超过这个量级才值得打扰。
 pub(super) const STALL_NOTICE_AFTER: Duration = Duration::from_secs(180);
 /// 静默多久开始兜底收口：先请求取消，宽限期后仍无响应则本地收口。
-pub(super) const STALL_CANCEL_AFTER: Duration = Duration::from_secs(900);
+///
+/// 取值刻意宽松：活动时钟只认 **Agent 侧入站事件**，而「一次长时间模型调用」
+/// 与「Agent 在等 `run_in_background` 任务」这两种**仍然活着**的情形都不产生
+/// 任何事件（后者只在完成时通知）。这一步会真的取消在跑的 query，所以阈值取
+/// 30 分钟——远超本地观测到的正常静默（现场正常回合的事件间隔是秒级到 1-2 分
+/// 钟，唯一一次 2 分 21 秒的空窗就是本次事故）。用户手动停止始终是更快的路径，
+/// 且现在同样有界（`CANCEL_SETTLE_GRACE`）。
+pub(super) const STALL_CANCEL_AFTER: Duration = Duration::from_secs(1800);
 /// 请求取消后等待 Agent 自行收口的宽限（上游 cancel floor 实测约 30 秒）。
 pub(super) const CANCEL_SETTLE_GRACE: Duration = Duration::from_secs(60);
 /// 适配器 stderr 提示的最小间隔：同一阵发的多行只提示一次。
@@ -115,6 +127,23 @@ pub(super) fn stderr_notice_worthy(line: &str) -> bool {
     ];
     let lower = line.to_ascii_lowercase();
     NEEDLES.iter().any(|needle| lower.contains(needle))
+}
+
+/// 是否应当为这一行 stderr 发出一条提示事件：内容值得提示、与上一条不同、
+/// 且过了限频窗口。抽成纯函数是为了让 spawn 侧那条 stderr 泵的逻辑可单测。
+pub(super) fn stderr_notice_due(
+    now: Instant,
+    last_notice_at: Option<Instant>,
+    last_notice_line: Option<&str>,
+    line: &str,
+) -> bool {
+    if !stderr_notice_worthy(line) {
+        return false;
+    }
+    if last_notice_line == Some(line) {
+        return false;
+    }
+    !last_notice_at.is_some_and(|at| now.saturating_duration_since(at) < STDERR_NOTICE_MIN_INTERVAL)
 }
 
 /// 记录本会话的 stall 收口次数，判断是否该升级为重启。
@@ -243,6 +272,49 @@ mod tests {
             "[session/query] sessionId=e6772626-52a8-45c4-8c2e-e89ddfefea99 resume=none apiType=native baseUrl=native"
         ));
         assert!(!stderr_notice_worthy(""));
+    }
+
+    #[test]
+    fn forkguard_stderr_notice_gate_throttles_and_dedupes() {
+        let base = Instant::now();
+        let long_line =
+            "Session x: cancel floor elapsed without the SDK yielding; forcing \"cancelled\"";
+        let other_line = "PANIC: unwrap failed";
+        assert!(
+            stderr_notice_due(base, None, None, long_line),
+            "首条命中措辞的 stderr 应当提示"
+        );
+        assert!(
+            !stderr_notice_due(
+                base + Duration::from_secs(5),
+                Some(base),
+                Some(long_line),
+                long_line
+            ),
+            "同一条重复打印不再产生事件（长时间 wedged 不刷 timeline）"
+        );
+        assert!(
+            !stderr_notice_due(
+                base + Duration::from_secs(5),
+                Some(base),
+                Some(long_line),
+                other_line
+            ),
+            "限频窗口内即使内容不同也只留一条"
+        );
+        assert!(
+            stderr_notice_due(
+                base + STDERR_NOTICE_MIN_INTERVAL + Duration::from_secs(1),
+                Some(base),
+                Some(long_line),
+                other_line
+            ),
+            "过了限频窗口、内容不同才再提示"
+        );
+        assert!(
+            !stderr_notice_due(base, None, None, "[session/query] sessionId=x resume=none"),
+            "正常 banner 不提示"
+        );
     }
 
     #[test]

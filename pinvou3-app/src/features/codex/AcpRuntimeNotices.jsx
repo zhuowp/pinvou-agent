@@ -291,7 +291,8 @@ export function AgentRuntimeNotice({
 }) {
   if (!notice) return null;
   const fromAdapter = notice.kind === 'agent_stderr';
-  const restarted = notice.kind === 'agent_session_restarted';
+  const restarted = notice.kind === 'agent_session_restarted'
+    || notice.kind === 'agent_session_restarted_fresh';
   const title = fromAdapter
     ? copy.agentStderr(agentName)
     : restarted
@@ -300,7 +301,9 @@ export function AgentRuntimeNotice({
   const description = fromAdapter
     ? copy.agentStderrHint
     : restarted
-      ? copy.agentRestartHint
+      ? (notice.kind === 'agent_session_restarted_fresh'
+        ? copy.agentRestartFreshHint
+        : copy.agentRestartHint)
       : notice.kind === 'cancel_timeout'
         ? copy.agentCancelTimeoutHint
         : notice.kind === 'agent_stall_restart'

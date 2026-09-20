@@ -763,6 +763,8 @@ struct AcpSession {
     /// 上一次 stall 收口判定「该换会话了」；由 `get_or_spawn` 在下一条消息
     /// 到达时执行 evict + 重新 spawn（会话上下文经 session/load 恢复）。
     restart_requested: AtomicBool,
+    /// 本次 spawn 是否成功恢复了既有 ACP 会话（见 `spawn_session`）。
+    resumed_session: bool,
     /// 停止兜底轮询的去重标记：连点停止只保留一个轮询任务。
     cancel_settle_pending: AtomicBool,
 }
@@ -3835,6 +3837,7 @@ impl AcpPool {
             "session:resolve_start",
             format!("session_id={session_id}"),
         );
+        let mut restarted_after_stall = false;
         let mut sessions = self.sessions.lock().await;
         if let Some(runtime) = sessions.get(session_id).cloned() {
             if !runtime.restart_requested.load(Ordering::Acquire) {
@@ -3860,10 +3863,11 @@ impl AcpPool {
                 "session:restart_after_stall",
                 format!("session_id={session_id}"),
             );
-            EventBridge::new(self.app.clone(), session_id.to_string()).emit(
-                "runtime_notice",
-                json!({ "kind": "agent_session_restarted" }),
-            );
+            // 旧运行时的 bridge 可能仍有在飞的 flush；新 bridge 构造时会重读
+            // timeline 尾部并据此继续分配 seq，编号保持单调。重启通知延后到新
+            // 运行时建好后由它发出（见下面 insert 之后），这样也能区分「真的
+            // 恢复了旧会话」与「只能新建会话」。
+            restarted_after_stall = true;
             sessions = self.sessions.lock().await;
         }
         // 与 spawn_session 一致走 self.backend()，让辅助索引缺失的会话在
@@ -3912,6 +3916,18 @@ impl AcpPool {
             }
         };
         sessions.insert(session_id.to_string(), runtime.clone());
+        if restarted_after_stall {
+            // 只有真的恢复了旧会话才承诺「历史保留」：适配器不支持 load_session
+            // 或 load 失败时 spawn_session 会静默新建会话，此时必须如实告知用户。
+            let kind = if runtime.resumed_session {
+                "agent_session_restarted"
+            } else {
+                "agent_session_restarted_fresh"
+            };
+            runtime
+                .bridge
+                .emit("runtime_notice", json!({ "kind": kind }));
+        }
         diagnostics::write(
             &operation_id,
             "session:ready",
@@ -3993,15 +4009,16 @@ impl AcpPool {
                         format!("agent={agent_id} session_id={sid} stderr={line}"),
                     );
                     // 适配器把真正的异常写进 stderr（例如「cancel floor … wedged」），
-                    // 只落盘不够：用户看不到，只能对着永久转圈的界面猜。命中稳定
-                    // 措辞时透出一份（原文截断、限频），由前端提示。
-                    let throttled = last_notice
-                        .is_some_and(|at| at.elapsed() < stall::STDERR_NOTICE_MIN_INTERVAL);
-                    // 同一条卡死信息重复打印时不再产生新事件：限频之外再按内容
-                    // 去重，长时间 wedged 的会话不会把 timeline 刷成一串重复项。
-                    let repeated = last_notice_line.as_deref() == Some(line.as_str());
-                    if !repeated && !throttled && stall::stderr_notice_worthy(&line) {
-                        last_notice = Some(Instant::now());
+                    // 只落盘不够：用户看不到，只能对着永久转圈的界面猜。闸门
+                    // （措辞命中 + 限频 + 内容去重）抽在 stall.rs 里做单测。
+                    let now = Instant::now();
+                    if stall::stderr_notice_due(
+                        now,
+                        last_notice,
+                        last_notice_line.as_deref(),
+                        &line,
+                    ) {
+                        last_notice = Some(now);
                         last_notice_line = Some(line.clone());
                         notice_bridge.emit(
                             "runtime_notice",
@@ -4208,7 +4225,9 @@ impl AcpPool {
         } else {
             self.config_defaults.get(backend)
         };
-        let (acp_session_id, mut mode_state, mut config_options) =
+        // `resumed_session` 记录这次 spawn 是「恢复」还是「新建」：重启兜底要如实
+        // 告诉用户历史是否被带过来（load_session 缺失或 load 失败都会静默新建）。
+        let (acp_session_id, mut mode_state, mut config_options, resumed_session) =
             if initialized.agent_capabilities.load_session {
                 if let Some(saved_id) = saved.acp_session_id.clone() {
                     replay_suppressed.store(true, Ordering::Release);
@@ -4222,20 +4241,27 @@ impl AcpPool {
                             saved_id,
                             response.modes,
                             response.config_options.unwrap_or_default(),
+                            true,
                         ),
                         Err(error) => {
                             eprintln!(
                                 "[pinvou3-app] {} ACP 恢复会话失败，改建新会话: {error}",
                                 backend.display_name()
                             );
-                            new_acp_session(&connection, &workspace, backend).await?
+                            let (id, modes, options) =
+                                new_acp_session(&connection, &workspace, backend).await?;
+                            (id, modes, options, false)
                         }
                     }
                 } else {
-                    new_acp_session(&connection, &workspace, backend).await?
+                    let (id, modes, options) =
+                        new_acp_session(&connection, &workspace, backend).await?;
+                    (id, modes, options, false)
                 }
             } else {
-                new_acp_session(&connection, &workspace, backend).await?
+                let (id, modes, options) =
+                    new_acp_session(&connection, &workspace, backend).await?;
+                (id, modes, options, false)
             };
         restore_config_values(
             &connection,
@@ -4302,6 +4328,7 @@ impl AcpPool {
             pending_elicitations,
             stall_settles: parking_lot::Mutex::new(stall::StallSettleTracker::new()),
             restart_requested: AtomicBool::new(false),
+            resumed_session,
             cancel_settle_pending: AtomicBool::new(false),
             busy: AtomicBool::new(false),
             configuring: AtomicBool::new(false),

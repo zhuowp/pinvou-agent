@@ -62,6 +62,7 @@ const AGENT_RUNTIME_NOTICE_KINDS = new Set([
   'agent_stall_settled',
   'agent_stall_restart',
   'agent_session_restarted',
+  'agent_session_restarted_fresh',
   'cancel_timeout',
 ]);
 

@@ -136,6 +136,7 @@ const codexEn = {
   agentRestarted:agent=>`${agent} session restarted`,
   agentStallRestartHint:'The same session stopped responding repeatedly, so your next message will continue in a fresh agent session (the conversation history is kept).',
   agentRestartHint:'The previous agent session stopped responding repeatedly, so a fresh one took over; the conversation history is kept, and any unfinished turn needs to be sent again.',
+  agentRestartFreshHint:'The previous agent session stopped responding repeatedly, so a fresh one took over. This agent could not restore the earlier conversation, so please restate the context you need; any unfinished turn needs to be sent again.',
   runtimeSources:{ system:'System CLI', override:'Custom CLI', bundled:'Bundled bridge', legacy_bundled:'Bundled Codex' },
 };
 
