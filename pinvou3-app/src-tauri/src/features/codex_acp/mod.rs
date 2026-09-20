@@ -820,13 +820,15 @@ impl AcpSession {
                     Some(cursor) => kimi_failure_after(&cursor).await,
                     None => None,
                 } {
-                    crate::features::assistant::timing::finish_turn(
+                    let claimed =
+                        self.bridge
+                            .finish_turn_once(&turn_id, "Failed", Some(&error), None);
+                    Self::close_timing_when_claimed(
                         &self.bridge_session_id(),
+                        claimed,
                         "Failed",
                         Some(&error),
                     );
-                    self.bridge
-                        .finish_turn_once(&turn_id, "Failed", Some(&error), None);
                     return false;
                 }
                 let status = match response.stop_reason {
@@ -836,27 +838,45 @@ impl AcpSession {
                     StopReason::Refusal => "Refused",
                     _ => "Completed",
                 };
-                crate::features::assistant::timing::finish_turn(
-                    &self.bridge_session_id(),
-                    status,
-                    None,
-                );
-                // 看门狗可能已把该回合本地收口（Agent 长时间无响应）：此时不再补发。
-                self.bridge.finish_turn_once(&turn_id, status, None, None);
+                // 看门狗可能已把该回合本地收口（Agent 长时间无响应）：此时不再
+                // 补发，timing 也由收口的那一方负责（见 close_timing_when_claimed）。
+                let claimed = self.bridge.finish_turn_once(&turn_id, status, None, None);
+                Self::close_timing_when_claimed(&self.bridge_session_id(), claimed, status, None);
                 false
             }
             Err(error) => {
                 let message = format!("ACP Agent: {error}");
                 let upgrade_required = codex_upgrade_required(&message);
-                crate::features::assistant::timing::finish_turn(
+                let claimed =
+                    self.bridge
+                        .finish_turn_once(&turn_id, "Failed", Some(&message), None);
+                Self::close_timing_when_claimed(
                     &self.bridge_session_id(),
+                    claimed,
                     "Failed",
                     Some(&message),
                 );
-                self.bridge
-                    .finish_turn_once(&turn_id, "Failed", Some(&message), None);
                 upgrade_required
             }
+        }
+    }
+
+    /// timing 侧的回合收口：只有赢得认领的那一方关。
+    ///
+    /// 一个回合在 timeline 与 timing 两处注册表里各有一条记录，收口必须同源。
+    /// `claimed` 为假表示别的路径（看门狗、停止兜底）已经收口过该回合，并且
+    /// 已经关掉了它对应的 timing：这里再关一次不会无事发生——timing 每会话只
+    /// 留一条、`finish_turn_internal` 取的是队尾，用户若已经开了新回合，这一关
+    /// 就把新回合错记成旧回合的结果（`has_active_turn` 变假会让同工作区的分支
+    /// 切换守卫失效，`assistant_done` 也会张冠李戴）。
+    fn close_timing_when_claimed(
+        session_id: &str,
+        claimed: bool,
+        status: &str,
+        error: Option<&str>,
+    ) {
+        if claimed {
+            crate::features::assistant::timing::finish_turn(session_id, status, error);
         }
     }
 
@@ -907,7 +927,7 @@ impl AcpSession {
                         }
                         stall::StallStep::Settle => {
                             settled = true;
-                            self.bridge.finish_turn_once(
+                            let claimed = self.bridge.finish_turn_once(
                                 turn_id,
                                 "Interrupted",
                                 None,
@@ -916,9 +936,11 @@ impl AcpSession {
                             // timing 注册表也要收口：否则 has_active_turn 仍为真，
                             // 同工作区的分支切换会被永久挡住（commands/codex.rs 的
                             // 跨会话守卫读的就是它），而 timing sidecar 会留下一条
-                            // 没有 assistant_done 的 user_start。
-                            crate::features::assistant::timing::finish_turn(
+                            // 没有 assistant_done 的 user_start。只有认领到本回合的
+                            // 一方关（见 close_timing_when_claimed）。
+                            Self::close_timing_when_claimed(
                                 &self.bridge_session_id(),
+                                claimed,
                                 "Interrupted",
                                 None,
                             );
@@ -3295,18 +3317,27 @@ impl AcpPool {
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
             if runtime.busy.load(Ordering::Acquire) {
-                if let Some(turn_id) = runtime.bridge.current_turn_id() {
+                let turn_id = runtime.bridge.current_turn_id();
+                let claimed = turn_id.as_deref().is_some_and(|turn_id| {
                     runtime.bridge.finish_turn_once(
-                        &turn_id,
+                        turn_id,
                         "Interrupted",
                         None,
                         Some("cancel_timeout"),
-                    );
-                }
-                runtime.busy.store(false, Ordering::Release);
+                    )
+                });
                 // 与看门狗收口同理：timing 不关掉，跨会话守卫会一直认为该
-                // 工作区还有回合在跑，分支切换会被挡住。
-                crate::features::assistant::timing::finish_turn(&session_id, "Interrupted", None);
+                // 工作区还有回合在跑，分支切换会被挡住。收口顺序统一为
+                // 认领 -> timing -> busy，且只有认领到本回合（或根本没有可认领
+                // 的回合，例如 prompt 还没登记 turn_id）的一方才关 timing：
+                // 认领失败说明看门狗已经收口并关过它了（见 close_timing_when_claimed）。
+                AcpSession::close_timing_when_claimed(
+                    &session_id,
+                    claimed || turn_id.is_none(),
+                    "Interrupted",
+                    None,
+                );
+                runtime.busy.store(false, Ordering::Release);
                 runtime
                     .bridge
                     .emit("runtime_notice", json!({ "kind": "cancel_timeout" }));
@@ -5484,5 +5515,29 @@ mod tests {
             prepare.contains(&format!("CLAUDE_ACP_VERSION=\"{CLAUDE_ACP_VERSION}\"")),
             "prepare-codex-bridge-runtime.sh 必须钉同一个适配器版本"
         );
+    }
+
+    /// 迟到的收口不得关闭别人的回合。
+    ///
+    /// 看门狗/停止兜底本地收口后 `busy` 立刻放开，用户可以马上开新回合；此时
+    /// 被丢弃的 prompt future 才失败返回，若它无条件关 timing，关掉的是用户
+    /// 刚开的那条记录（timing 每会话只留一条、`finish_turn_internal` 取队尾）：
+    /// `has_active_turn` 变假会让同工作区的分支切换守卫失效，`assistant_done`
+    /// 也会带上前一回合的状态。
+    #[test]
+    fn forkguard_late_close_does_not_finish_the_next_timing_turn() {
+        let session_id = "acp-late-close-test";
+        crate::features::assistant::timing::start_turn(session_id);
+        AcpSession::close_timing_when_claimed(session_id, false, "Failed", Some("ACP Agent: x"));
+        assert!(
+            crate::features::assistant::timing::has_queued_active_turn(session_id),
+            "没认领到回合的一方不得关掉 timing"
+        );
+        AcpSession::close_timing_when_claimed(session_id, true, "Failed", Some("ACP Agent: x"));
+        assert!(
+            !crate::features::assistant::timing::has_queued_active_turn(session_id),
+            "认领到本回合的一方负责收口"
+        );
+        crate::features::assistant::timing::clear_session(session_id);
     }
 }

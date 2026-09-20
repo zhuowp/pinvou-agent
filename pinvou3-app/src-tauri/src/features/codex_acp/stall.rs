@@ -16,10 +16,9 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 /// 看门狗巡检间隔。
 pub(super) const STALL_TICK: Duration = Duration::from_secs(15);
@@ -50,28 +49,25 @@ pub(super) const STDERR_NOTICE_MAX_CHARS: usize = 400;
 pub(super) const STALL_RESTART_WINDOW: Duration = Duration::from_secs(3600);
 pub(super) const STALL_RESTART_AFTER: usize = 2;
 
-/// Agent 侧活动时钟（epoch 毫秒）。只记录 Agent 的活动：入站通知、权限/询问
-/// 请求、prompt 响应。宿主自己发出的事件不计入，否则看门狗会被自己的提示刷新。
-pub(super) type ActivityClock = Arc<AtomicU64>;
-
-fn now_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis() as u64)
-        .unwrap_or(0)
-}
+/// Agent 侧活动时钟（单调时钟）。只记录 Agent 的活动：入站通知与权限/询问
+/// 请求（prompt 响应会直接跳出等待循环，不需要推进它）。宿主自己发出的事件
+/// 不计入，否则看门狗会被自己的提示刷新。
+///
+/// 用 `Instant` 而非墙上时钟：后者被 NTP/手工调整往回拨时，「距上次活动的
+/// 时长」会一直算成 0，看门狗静默失效——正是它要防的那种永久「处理中」。
+pub(super) type ActivityClock = Arc<Mutex<Instant>>;
 
 pub(super) fn new_activity_clock() -> ActivityClock {
-    Arc::new(AtomicU64::new(now_millis()))
+    Arc::new(Mutex::new(Instant::now()))
 }
 
 pub(super) fn mark_activity(clock: &ActivityClock) {
-    clock.store(now_millis(), Ordering::Release);
+    *clock.lock() = Instant::now();
 }
 
 /// 距最近一次 Agent 侧活动的时长。
 pub(super) fn quiet_for(clock: &ActivityClock) -> Duration {
-    Duration::from_millis(now_millis().saturating_sub(clock.load(Ordering::Acquire)))
+    clock.lock().elapsed()
 }
 
 /// 一轮巡检应执行的动作。
@@ -186,7 +182,7 @@ mod tests {
     use super::*;
 
     fn clock_aged(age: Duration) -> ActivityClock {
-        Arc::new(AtomicU64::new(now_millis() - age.as_millis() as u64))
+        Arc::new(Mutex::new(Instant::now() - age))
     }
 
     #[test]
