@@ -263,9 +263,26 @@ assert.equal(
   latestAgentRuntimeNotice([
     envelope(1, 'runtime_notice', { kind: 'agent_stall_settled' }),
     envelope(2, 'turn_started', {}),
+  ])?.kind,
+  'agent_stall_settled',
+  'a newer user turn must not hide the notice that was produced for it (the restart notice is emitted on the next message)',
+);
+assert.equal(
+  latestAgentRuntimeNotice([
+    envelope(1, 'runtime_notice', { kind: 'agent_stall_settled' }),
+    envelope(2, 'turn_completed', { status: 'Interrupted' }),
+  ])?.kind,
+  'agent_stall_settled',
+  'the notice survives its own interrupted completion so the ending stays explained',
+);
+assert.equal(
+  latestAgentRuntimeNotice([
+    envelope(1, 'runtime_notice', { kind: 'cancel_timeout' }),
+    envelope(2, 'turn_started', {}),
+    envelope(3, 'turn_completed', { status: 'Completed' }),
   ]),
   null,
-  'a newer user turn expires the notice',
+  'a completed turn afterwards means the session recovered, so the notice expires',
 );
 assert.equal(
   latestAgentRuntimeNotice([
@@ -285,6 +302,23 @@ assert.match(
   view,
   /latestAgentRuntimeNotice\(events\)/,
   'the ACP view must derive the notice from the event stream',
+);
+for (const kind of ['agent_stall_restart', 'agent_session_restarted']) {
+  assert.equal(
+    latestAgentRuntimeNotice([envelope(1, 'runtime_notice', { kind })])?.kind,
+    kind,
+    `${kind} must surface (repeated-stall escalation and the restart itself)`,
+  );
+}
+assert.match(
+  view,
+  /redactDisplayError\(notice\.detail/,
+  'the notice detail is adapter stderr text and must be redacted like turn errors',
+);
+assert.match(
+  notices,
+  /copy\.agentRestartHint/,
+  'the restarted-session notice must use its own hint copy',
 );
 
 console.log('✓ ACP runtime notice state matrix passed');

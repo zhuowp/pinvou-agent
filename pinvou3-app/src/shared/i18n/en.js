@@ -133,6 +133,9 @@ const codexEn = {
   agentStallSettledHint:'The agent stopped responding for too long, so this turn was settled as interrupted. You can send again or continue.',
   agentCancelTimeoutHint:'Stop was not acknowledged by the agent, so this turn was settled as interrupted.',
   agentStderrHint:'Raw error text from the agent adapter (also recorded in the session log).',
+  agentRestarted:agent=>`${agent} session restarted`,
+  agentStallRestartHint:'The same session stopped responding repeatedly, so your next message will continue in a fresh agent session (the conversation history is kept).',
+  agentRestartHint:'The previous agent session stopped responding repeatedly, so a fresh one took over; the conversation history is kept, and any unfinished turn needs to be sent again.',
   runtimeSources:{ system:'System CLI', override:'Custom CLI', bundled:'Bundled bridge', legacy_bundled:'Bundled Codex' },
 };
 

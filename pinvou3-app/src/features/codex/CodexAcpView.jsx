@@ -46,6 +46,7 @@ import {
   mergeAcpTimelineSnapshot,
   updateAcpAttachmentDraft,
   projectAcpTimeline,
+  redactDisplayError,
   resolveAcpSessionControls,
 } from './acp-state.js';
 import {
@@ -1260,7 +1261,15 @@ export function CodexAcpView({
   const visibleServiceFailure = serviceFailure?.key === dismissedFailureKey
     ? null
     : serviceFailure;
-  const runtimeNotice = useMemo(() => latestAgentRuntimeNotice(events), [events]);
+  // 提示里可能带适配器 stderr 原文：与回合错误一致，展示前无条件脱敏。
+  const runtimeNotice = useMemo(() => {
+    const notice = latestAgentRuntimeNotice(events);
+    if (!notice) return null;
+    return {
+      ...notice,
+      detail: redactDisplayError(notice.detail, acpModelServiceLanguage) || '',
+    };
+  }, [events, acpModelServiceLanguage]);
   const visibleRuntimeNotice = runtimeNotice?.key === dismissedNoticeKey
     ? null
     : runtimeNotice;

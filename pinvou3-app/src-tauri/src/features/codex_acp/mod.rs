@@ -90,7 +90,11 @@ pub use store::{
 pub const CODEX_ACP_VERSION: &str = "1.1.5";
 pub const CODEX_ACP_SESSION_MODEL: &str = "Codex (ACP)";
 const CODEX_ACP_PACKAGE: &str = "@agentclientprotocol/codex-acp";
-pub const CLAUDE_ACP_VERSION: &str = "0.62.0";
+/// 随包 claude-agent-acp 的版本。必须与
+/// `scripts/codex-bridge-runtime/package.json`（及其锁文件）里的 pin 一致：
+/// 这个值会写进会话的 `acp-state.json` 作为声明的适配器版本，
+/// `forkguard_declared_adapter_versions_match_the_bridge_pin` 钉住一致性。
+pub const CLAUDE_ACP_VERSION: &str = "0.79.0";
 const CLAUDE_ACP_PACKAGE: &str = "@agentclientprotocol/claude-agent-acp";
 const CLAUDE_ACP_SESSION_MODEL: &str = "Claude Code (ACP)";
 const KIMI_ACP_PACKAGE: &str = "kimi acp";
@@ -754,6 +758,13 @@ struct AcpSession {
     /// 静默属于人的思考时间，看门狗不得据此判定 Agent 卡死。
     pending_permissions: Arc<Mutex<HashMap<String, PendingPermission>>>,
     pending_elicitations: Arc<Mutex<HashMap<String, PendingElicitation>>>,
+    /// 本会话的 stall 收口历史：窗口内反复卡死才升级为重启运行时。
+    stall_settles: parking_lot::Mutex<stall::StallSettleTracker>,
+    /// 上一次 stall 收口判定「该换会话了」；由 `get_or_spawn` 在下一条消息
+    /// 到达时执行 evict + 重新 spawn（会话上下文经 session/load 恢复）。
+    restart_requested: AtomicBool,
+    /// 停止兜底轮询的去重标记：连点停止只保留一个轮询任务。
+    cancel_settle_pending: AtomicBool,
 }
 
 impl AcpSession {
@@ -900,10 +911,26 @@ impl AcpSession {
                                 None,
                                 Some("agent_stall_timeout"),
                             );
+                            // timing 注册表也要收口：否则 has_active_turn 仍为真，
+                            // 同工作区的分支切换会被永久挡住（commands/codex.rs 的
+                            // 跨会话守卫读的就是它），而 timing sidecar 会留下一条
+                            // 没有 assistant_done 的 user_start。
+                            crate::features::assistant::timing::finish_turn(
+                                &self.bridge_session_id(),
+                                "Interrupted",
+                                None,
+                            );
                             // 让界面回到空闲：Agent 已经不再回答这个回合，继续
                             // 显示「处理中」只会让用户以为还能等。
                             self.busy.store(false, Ordering::Release);
-                            self.bridge.emit("runtime_notice", json!({ "kind": "agent_stall_settled" }));
+                            // 同一会话反复卡死才升级为重启（见 StallSettleTracker）：
+                            // 首次只摘回合，避免误杀 Agent 正在跑的长时后台任务。
+                            let restart = self.stall_settles.lock().record(Instant::now());
+                            if restart {
+                                self.restart_requested.store(true, Ordering::Release);
+                            }
+                            let kind = if restart { "agent_stall_restart" } else { "agent_stall_settled" };
+                            self.bridge.emit("runtime_notice", json!({ "kind": kind }));
                         }
                     }
                 }
@@ -3252,37 +3279,47 @@ impl AcpPool {
 
     /// 用户停止后的兜底收口：宽限期内 Agent 没有给出响应就本地收口。
     fn schedule_cancel_settle(session_id: String, runtime: Arc<AcpSession>) {
+        // 连点停止只保留一个轮询任务；标记在任务结束时清掉，下一轮停止
+        // （新回合）仍能正常排程。
+        if runtime.cancel_settle_pending.swap(true, Ordering::AcqRel) {
+            return;
+        }
         tokio::spawn(async move {
             let deadline = Instant::now() + stall::CANCEL_SETTLE_GRACE;
             while Instant::now() < deadline {
                 if !runtime.busy.load(Ordering::Acquire) {
-                    return;
+                    break;
                 }
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
-            if !runtime.busy.load(Ordering::Acquire) {
-                return;
-            }
-            if let Some(turn_id) = runtime.bridge.current_turn_id() {
-                runtime.bridge.finish_turn_once(
-                    &turn_id,
-                    "Interrupted",
-                    None,
-                    Some("cancel_timeout"),
+            if runtime.busy.load(Ordering::Acquire) {
+                if let Some(turn_id) = runtime.bridge.current_turn_id() {
+                    runtime.bridge.finish_turn_once(
+                        &turn_id,
+                        "Interrupted",
+                        None,
+                        Some("cancel_timeout"),
+                    );
+                }
+                runtime.busy.store(false, Ordering::Release);
+                // 与看门狗收口同理：timing 不关掉，跨会话守卫会一直认为该
+                // 工作区还有回合在跑，分支切换会被挡住。
+                crate::features::assistant::timing::finish_turn(&session_id, "Interrupted", None);
+                runtime
+                    .bridge
+                    .emit("runtime_notice", json!({ "kind": "cancel_timeout" }));
+                diagnostics::write(
+                    &diagnostics::operation_id("cancel-settle"),
+                    "session:cancel_timeout",
+                    format!(
+                        "session_id={session_id} grace_secs={}",
+                        stall::CANCEL_SETTLE_GRACE.as_secs()
+                    ),
                 );
             }
-            runtime.busy.store(false, Ordering::Release);
             runtime
-                .bridge
-                .emit("runtime_notice", json!({ "kind": "cancel_timeout" }));
-            diagnostics::write(
-                &diagnostics::operation_id("cancel-settle"),
-                "session:cancel_timeout",
-                format!(
-                    "session_id={session_id} grace_secs={}",
-                    stall::CANCEL_SETTLE_GRACE.as_secs()
-                ),
-            );
+                .cancel_settle_pending
+                .store(false, Ordering::Release);
         });
     }
 
@@ -3799,16 +3836,35 @@ impl AcpPool {
             format!("session_id={session_id}"),
         );
         let mut sessions = self.sessions.lock().await;
-        if let Some(runtime) = sessions.get(session_id) {
+        if let Some(runtime) = sessions.get(session_id).cloned() {
+            if !runtime.restart_requested.load(Ordering::Acquire) {
+                diagnostics::write(
+                    &operation_id,
+                    "session:reused",
+                    format!("session_id={session_id}"),
+                );
+                // 复用即活动：前端对可见会话的状态轮询会持续刷新空闲时钟，
+                // 这正好与「active 会话不回收」的保守语义一致。
+                runtime.note_activity();
+                return Ok(runtime);
+            }
+            // 同一会话在窗口内反复 stall：采纳上游「可能需要新会话」的建议，
+            // 丢弃这个运行时，让下面的 spawn_session 重新拉起（会话上下文由
+            // session/load 恢复，只丢掉在飞的那次工作）。首次 stall 不走到这里，
+            // 因为无法从外部区分「query 卡死」与「Agent 在等长时后台任务」。
+            sessions.remove(session_id);
+            drop(sessions);
+            runtime.shutdown().await;
             diagnostics::write(
                 &operation_id,
-                "session:reused",
+                "session:restart_after_stall",
                 format!("session_id={session_id}"),
             );
-            // 复用即活动：前端对可见会话的状态轮询会持续刷新空闲时钟，
-            // 这正好与「active 会话不回收」的保守语义一致。
-            runtime.note_activity();
-            return Ok(runtime.clone());
+            EventBridge::new(self.app.clone(), session_id.to_string()).emit(
+                "runtime_notice",
+                json!({ "kind": "agent_session_restarted" }),
+            );
+            sessions = self.sessions.lock().await;
         }
         // 与 spawn_session 一致走 self.backend()，让辅助索引缺失的会话在
         // acp_record 处得到明确报错，而不是误导性的「当前会话不是 ACP 会话」。
@@ -3922,6 +3978,7 @@ impl AcpPool {
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
                 let mut last_notice: Option<Instant> = None;
+                let mut last_notice_line: Option<String> = None;
                 while let Ok(Some(line)) = lines.next_line().await {
                     {
                         let mut tail = stderr_tail.lock();
@@ -3940,8 +3997,12 @@ impl AcpPool {
                     // 措辞时透出一份（原文截断、限频），由前端提示。
                     let throttled = last_notice
                         .is_some_and(|at| at.elapsed() < stall::STDERR_NOTICE_MIN_INTERVAL);
-                    if !throttled && stall::stderr_notice_worthy(&line) {
+                    // 同一条卡死信息重复打印时不再产生新事件：限频之外再按内容
+                    // 去重，长时间 wedged 的会话不会把 timeline 刷成一串重复项。
+                    let repeated = last_notice_line.as_deref() == Some(line.as_str());
+                    if !repeated && !throttled && stall::stderr_notice_worthy(&line) {
                         last_notice = Some(Instant::now());
+                        last_notice_line = Some(line.clone());
                         notice_bridge.emit(
                             "runtime_notice",
                             json!({
@@ -4239,6 +4300,9 @@ impl AcpPool {
             activity,
             pending_permissions,
             pending_elicitations,
+            stall_settles: parking_lot::Mutex::new(stall::StallSettleTracker::new()),
+            restart_requested: AtomicBool::new(false),
+            cancel_settle_pending: AtomicBool::new(false),
             busy: AtomicBool::new(false),
             configuring: AtomicBool::new(false),
             prompt_pending: AtomicUsize::new(0),
@@ -5359,5 +5423,39 @@ mod tests {
         assert!(!stale_official_target(&root.join("absent"), None));
 
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// 声明的适配器版本必须与随包 pin 一致。
+    ///
+    /// `CLAUDE_ACP_VERSION` 会被写进会话的 `acp-state.json`（`adapter.version`）
+    /// 当作「本会话用的适配器版本」：它一旦落后于 bridge 的 pin，记录出来的
+    /// 版本就是假的（本轮修过一次：常量停在 0.62.0，而随包已经是 0.70.0→0.79.0）。
+    #[test]
+    fn forkguard_declared_adapter_versions_match_the_bridge_pin() {
+        let manifest = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../scripts/codex-bridge-runtime/package.json"
+        ))
+        .expect("read the bridge runtime manifest");
+        let pinned = serde_json::from_str::<Value>(&manifest)
+            .expect("parse the bridge runtime manifest")["dependencies"]
+            ["@agentclientprotocol/claude-agent-acp"]
+            .as_str()
+            .expect("claude-agent-acp pin")
+            .to_string();
+        assert_eq!(
+            pinned, CLAUDE_ACP_VERSION,
+            "CLAUDE_ACP_VERSION 必须等于随包 claude-agent-acp 的 pin"
+        );
+
+        let prepare = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../scripts/prepare-codex-bridge-runtime.sh"
+        ))
+        .expect("read the bridge runtime script");
+        assert!(
+            prepare.contains(&format!("CLAUDE_ACP_VERSION=\"{CLAUDE_ACP_VERSION}\"")),
+            "prepare-codex-bridge-runtime.sh 必须钉同一个适配器版本"
+        );
     }
 }

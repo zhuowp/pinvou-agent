@@ -9,9 +9,10 @@
 //! 本模块只提供判定：活动时钟、静默分级、回合认领与 stderr 提示筛选；
 //! 实际动作（提示、请求取消、本地收口）由调用方执行，二者都可单测。
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::RwLock;
 
@@ -27,6 +28,10 @@ pub(super) const CANCEL_SETTLE_GRACE: Duration = Duration::from_secs(60);
 pub(super) const STDERR_NOTICE_MIN_INTERVAL: Duration = Duration::from_secs(30);
 /// 提示给用户的 stderr 行长度上限（原文截断，不改写）。
 pub(super) const STDERR_NOTICE_MAX_CHARS: usize = 400;
+/// 同一会话反复卡死的判定窗口：窗口内第 `STALL_RESTART_AFTER` 次本地收口
+/// 才升级为重启 Agent 会话。
+pub(super) const STALL_RESTART_WINDOW: Duration = Duration::from_secs(600);
+pub(super) const STALL_RESTART_AFTER: usize = 2;
 
 /// Agent 侧活动时钟（epoch 毫秒）。只记录 Agent 的活动：入站通知、权限/询问
 /// 请求、prompt 响应。宿主自己发出的事件不计入，否则看门狗会被自己的提示刷新。
@@ -110,6 +115,36 @@ pub(super) fn stderr_notice_worthy(line: &str) -> bool {
     ];
     let lower = line.to_ascii_lowercase();
     NEEDLES.iter().any(|needle| lower.contains(needle))
+}
+
+/// 记录本会话的 stall 收口次数，判断是否该升级为重启。
+///
+/// 首次卡死只摘掉回合：宿主从外部无法区分「Agent 的 query 真卡死」与
+/// 「Agent 正在等一个长时间后台任务」（`run_in_background` 只在完成时通知），
+/// 而杀进程树会连带杀掉用户自己的长时任务。只有同一会话在窗口内**反复**
+/// 卡死时，才采纳上游「可能需要新会话」的结论去重启运行时。
+#[derive(Debug, Default)]
+pub(super) struct StallSettleTracker {
+    recent: VecDeque<Instant>,
+}
+
+impl StallSettleTracker {
+    pub(super) fn new() -> Self {
+        Self::default()
+    }
+
+    /// 记录一次本地 stall 收口；返回是否应当重启该会话的 ACP 运行时。
+    pub(super) fn record(&mut self, now: Instant) -> bool {
+        while self
+            .recent
+            .front()
+            .is_some_and(|at| now.saturating_duration_since(*at) > STALL_RESTART_WINDOW)
+        {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(now);
+        self.recent.len() >= STALL_RESTART_AFTER
+    }
 }
 
 #[cfg(test)]
@@ -208,5 +243,30 @@ mod tests {
             "[session/query] sessionId=e6772626-52a8-45c4-8c2e-e89ddfefea99 resume=none apiType=native baseUrl=native"
         ));
         assert!(!stderr_notice_worthy(""));
+    }
+
+    #[test]
+    fn forkguard_stall_tracker_restarts_only_on_a_repeat_settle() {
+        let mut tracker = StallSettleTracker::new();
+        let base = Instant::now();
+        assert!(
+            !tracker.record(base),
+            "首次卡死只摘回合：保留会话与它可能正在跑的后台任务"
+        );
+        assert!(
+            tracker.record(base + Duration::from_secs(60)),
+            "同一窗口内第二次卡死才升级为重启"
+        );
+    }
+
+    #[test]
+    fn forkguard_stall_tracker_forgets_settles_outside_the_window() {
+        let mut tracker = StallSettleTracker::new();
+        let base = Instant::now();
+        assert!(!tracker.record(base));
+        assert!(
+            !tracker.record(base + STALL_RESTART_WINDOW + Duration::from_secs(1)),
+            "窗口外的旧收口不再计数"
+        );
     }
 }

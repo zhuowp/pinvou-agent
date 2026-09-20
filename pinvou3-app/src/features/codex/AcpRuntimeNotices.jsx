@@ -291,16 +291,23 @@ export function AgentRuntimeNotice({
 }) {
   if (!notice) return null;
   const fromAdapter = notice.kind === 'agent_stderr';
+  const restarted = notice.kind === 'agent_session_restarted';
   const title = fromAdapter
     ? copy.agentStderr(agentName)
-    : copy.agentUnresponsive(agentName);
+    : restarted
+      ? copy.agentRestarted(agentName)
+      : copy.agentUnresponsive(agentName);
   const description = fromAdapter
     ? copy.agentStderrHint
-    : notice.kind === 'cancel_timeout'
-      ? copy.agentCancelTimeoutHint
-      : notice.kind === 'agent_stall_settled'
-        ? copy.agentStallSettledHint
-        : copy.agentStallHint;
+    : restarted
+      ? copy.agentRestartHint
+      : notice.kind === 'cancel_timeout'
+        ? copy.agentCancelTimeoutHint
+        : notice.kind === 'agent_stall_restart'
+          ? copy.agentStallRestartHint
+          : notice.kind === 'agent_stall_settled'
+            ? copy.agentStallSettledHint
+            : copy.agentStallHint;
   return (
     <div
       data-testid="acp-agent-runtime-notice"

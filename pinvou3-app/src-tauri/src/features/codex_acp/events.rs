@@ -177,6 +177,11 @@ fn project_acp_event_data_for_web(event_type: &str, value: Value) -> Value {
         "config_change_applied" => {
             project_allowed_fields(value, &["configId", "valueId", "message"])
         }
+        // 回合看门狗/适配器自述的运行时提示：只投影宿主自己的协议字段。
+        // `detail` 是适配器 stderr 原文（现场就含绝对路径，理论上还可能带网关
+        // 响应体或凭据），按本函数的既定边界留在本机——本地卡片与
+        // `codex-acp.log` 都能看到，Relay 不放行外来文本。
+        "runtime_notice" => project_allowed_fields(value, &["kind", "quietSeconds"]),
         // runtime_ready is a signal; the Web client fetches the authoritative
         // session info separately and does not need adapter capabilities here.
         "runtime_ready" => Value::Object(serde_json::Map::new()),
@@ -1925,6 +1930,30 @@ mod tests {
             project_acp_event_for_web(&future).event.data,
             json!({"webProjection": {"omitted": true}}),
             "new adapter events require an explicit Web projection before exposing data"
+        );
+    }
+
+    /// `runtime_notice` 只把宿主自己的协议字段放行到 Web/Relay：
+    /// `detail` 是适配器 stderr 原文（现场含绝对路径），按本模块既定边界留在本机。
+    #[test]
+    fn forkguard_runtime_notice_web_projection_keeps_only_host_fields() {
+        let mut notice = event(3, Some("turn-1"), "runtime_notice");
+        notice.event.data = json!({
+            "kind": "agent_stderr",
+            "agent": "claude",
+            "quietSeconds": 200,
+            "detail": "File C:\\Users\\l28756\\Temp\\x.ps1: cancel floor elapsed without the SDK yielding",
+        });
+        let projected = project_acp_event_for_web(&notice).event.data;
+        assert_eq!(projected["kind"], json!("agent_stderr"));
+        assert_eq!(projected["quietSeconds"], json!(200));
+        assert!(
+            projected.get("detail").is_none(),
+            "适配器 stderr 原文不得跨 Relay: {projected}"
+        );
+        assert!(
+            projected.get("agent").is_none(),
+            "Web 端标题取自当前 Agent 名，不需要载荷里的 agent 字段"
         );
     }
 

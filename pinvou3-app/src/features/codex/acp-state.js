@@ -539,4 +539,5 @@ export function buildElicitationContent(groups) {
 
 export {
   commandExecutionDetails,
+  redactDisplayError,
 };
