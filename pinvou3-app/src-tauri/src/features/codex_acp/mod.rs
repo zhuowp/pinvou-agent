@@ -808,10 +808,9 @@ impl AcpSession {
             None => None,
         };
         let result = self.await_prompt_with_stall_guard(&turn_id, blocks).await;
-        self.busy.store(false, Ordering::Release);
         // 响应返回也算一次活动：长时间流式输出的 turn 结束后重新计空闲。
         self.note_activity();
-        match result {
+        let restart = match result {
             Ok(response) => {
                 // Kimi ACP 将普通 provider failure 映射成 end_turn，详细错误只写入
                 // 会话日志。只读取本回合新增日志中的明确失败标记，避免把正常空回复
@@ -829,20 +828,32 @@ impl AcpSession {
                         "Failed",
                         Some(&error),
                     );
-                    return false;
+                    if claimed {
+                        self.busy.store(false, Ordering::Release);
+                    }
+                    false
+                } else {
+                    let status = match response.stop_reason {
+                        StopReason::EndTurn => "Completed",
+                        StopReason::Cancelled => "Interrupted",
+                        StopReason::MaxTokens | StopReason::MaxTurnRequests => "LimitReached",
+                        StopReason::Refusal => "Refused",
+                        _ => "Completed",
+                    };
+                    // 看门狗可能已把该回合本地收口（Agent 长时间无响应）：此时不再
+                    // 补发，timing 也由收口的那一方负责（见 close_timing_when_claimed）。
+                    let claimed = self.bridge.finish_turn_once(&turn_id, status, None, None);
+                    Self::close_timing_when_claimed(
+                        &self.bridge_session_id(),
+                        claimed,
+                        status,
+                        None,
+                    );
+                    if claimed {
+                        self.busy.store(false, Ordering::Release);
+                    }
+                    false
                 }
-                let status = match response.stop_reason {
-                    StopReason::EndTurn => "Completed",
-                    StopReason::Cancelled => "Interrupted",
-                    StopReason::MaxTokens | StopReason::MaxTurnRequests => "LimitReached",
-                    StopReason::Refusal => "Refused",
-                    _ => "Completed",
-                };
-                // 看门狗可能已把该回合本地收口（Agent 长时间无响应）：此时不再
-                // 补发，timing 也由收口的那一方负责（见 close_timing_when_claimed）。
-                let claimed = self.bridge.finish_turn_once(&turn_id, status, None, None);
-                Self::close_timing_when_claimed(&self.bridge_session_id(), claimed, status, None);
-                false
             }
             Err(error) => {
                 let message = format!("ACP Agent: {error}");
@@ -856,9 +867,13 @@ impl AcpSession {
                     "Failed",
                     Some(&message),
                 );
+                if claimed {
+                    self.busy.store(false, Ordering::Release);
+                }
                 upgrade_required
             }
-        }
+        };
+        restart
     }
 
     /// timing 侧的回合收口：只有赢得认领的那一方关。
@@ -944,17 +959,19 @@ impl AcpSession {
                                 "Interrupted",
                                 None,
                             );
-                            // 让界面回到空闲：Agent 已经不再回答这个回合，继续
-                            // 显示「处理中」只会让用户以为还能等。
-                            self.busy.store(false, Ordering::Release);
-                            // 同一会话反复卡死才升级为重启（见 StallSettleTracker）：
-                            // 首次只摘回合，避免误杀 Agent 正在跑的长时后台任务。
-                            let restart = self.stall_settles.lock().record(Instant::now());
-                            if restart {
-                                self.restart_requested.store(true, Ordering::Release);
+                            // 只有真正认领到本回合的一方才能释放 busy、计入 stall
+                            // 统计并发通知；否则可能清掉下一轮的 busy 状态。
+                            if claimed {
+                                self.busy.store(false, Ordering::Release);
+                                // 同一会话反复卡死才升级为重启（见 StallSettleTracker）：
+                                // 首次只摘回合，避免误杀 Agent 正在跑的长时后台任务。
+                                let restart = self.stall_settles.lock().record(Instant::now());
+                                if restart {
+                                    self.restart_requested.store(true, Ordering::Release);
+                                }
+                                let kind = if restart { "agent_stall_restart" } else { "agent_stall_settled" };
+                                self.bridge.emit("runtime_notice", json!({ "kind": kind }));
                             }
-                            let kind = if restart { "agent_stall_restart" } else { "agent_stall_settled" };
-                            self.bridge.emit("runtime_notice", json!({ "kind": kind }));
                         }
                     }
                 }
@@ -3283,7 +3300,8 @@ impl AcpPool {
                     // 停止不能无限期依赖 Agent 应答：上游在丢弃/吸收 prompt 时
                     // 可能永不回应，用户会以为停止按钮失灵（现场见到连点四次、
                     // 约 30 秒后才被适配器自己的 cancel floor 收口）。
-                    Self::schedule_cancel_settle(session_id.to_string(), runtime.clone());
+                    let turn_id = runtime.bridge.current_turn_id();
+                    self.schedule_cancel_settle(session_id.to_string(), runtime.clone(), turn_id);
                 } else {
                     // session 已恢复但当前进程没有活跃 prompt 时，session/cancel 无法
                     // 命中旧进程的 turn。直接收口持久化孤儿回合，让停止操作可恢复且幂等。
@@ -3302,12 +3320,18 @@ impl AcpPool {
     }
 
     /// 用户停止后的兜底收口：宽限期内 Agent 没有给出响应就本地收口。
-    fn schedule_cancel_settle(session_id: String, runtime: Arc<AcpSession>) {
+    fn schedule_cancel_settle(
+        &self,
+        session_id: String,
+        runtime: Arc<AcpSession>,
+        expected_turn_id: Option<String>,
+    ) {
         // 连点停止只保留一个轮询任务；标记在任务结束时清掉，下一轮停止
         // （新回合）仍能正常排程。
         if runtime.cancel_settle_pending.swap(true, Ordering::AcqRel) {
             return;
         }
+        let pool = self.clone();
         tokio::spawn(async move {
             let deadline = Instant::now() + stall::CANCEL_SETTLE_GRACE;
             while Instant::now() < deadline {
@@ -3317,38 +3341,42 @@ impl AcpPool {
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
             if runtime.busy.load(Ordering::Acquire) {
-                let turn_id = runtime.bridge.current_turn_id();
-                let claimed = turn_id.as_deref().is_some_and(|turn_id| {
-                    runtime.bridge.finish_turn_once(
-                        turn_id,
-                        "Interrupted",
-                        None,
-                        Some("cancel_timeout"),
-                    )
-                });
+                // Keep the pool lock while checking identity and claiming the turn.
+                // A restarted runtime must never let its old cancel poller close the
+                // replacement runtime's session-level timing entry.
+                let sessions = pool.sessions.lock().await;
+                let still_registered = sessions
+                    .get(&session_id)
+                    .is_some_and(|current| Arc::ptr_eq(current, &runtime));
+                let claimed = still_registered
+                    && expected_turn_id.as_deref() == runtime.bridge.current_turn_id().as_deref()
+                    && expected_turn_id.as_deref().is_some_and(|turn_id| {
+                        runtime.bridge.finish_turn_once(
+                            turn_id,
+                            "Interrupted",
+                            None,
+                            Some("cancel_timeout"),
+                        )
+                    });
                 // 与看门狗收口同理：timing 不关掉，跨会话守卫会一直认为该
                 // 工作区还有回合在跑，分支切换会被挡住。收口顺序统一为
-                // 认领 -> timing -> busy，且只有认领到本回合（或根本没有可认领
-                // 的回合，例如 prompt 还没登记 turn_id）的一方才关 timing：
-                // 认领失败说明看门狗已经收口并关过它了（见 close_timing_when_claimed）。
-                AcpSession::close_timing_when_claimed(
-                    &session_id,
-                    claimed || turn_id.is_none(),
-                    "Interrupted",
-                    None,
-                );
-                runtime.busy.store(false, Ordering::Release);
-                runtime
-                    .bridge
-                    .emit("runtime_notice", json!({ "kind": "cancel_timeout" }));
-                diagnostics::write(
-                    &diagnostics::operation_id("cancel-settle"),
-                    "session:cancel_timeout",
-                    format!(
-                        "session_id={session_id} grace_secs={}",
-                        stall::CANCEL_SETTLE_GRACE.as_secs()
-                    ),
-                );
+                // 认领 -> timing -> busy，且只有认领到预期回合的一方才关 timing：
+                // 认领失败说明看门狗、响应路径或另一轮停止任务已经收口。
+                AcpSession::close_timing_when_claimed(&session_id, claimed, "Interrupted", None);
+                if claimed {
+                    runtime.busy.store(false, Ordering::Release);
+                    runtime
+                        .bridge
+                        .emit("runtime_notice", json!({ "kind": "cancel_timeout" }));
+                    diagnostics::write(
+                        &diagnostics::operation_id("cancel-settle"),
+                        "session:cancel_timeout",
+                        format!(
+                            "session_id={session_id} grace_secs={}",
+                            stall::CANCEL_SETTLE_GRACE.as_secs()
+                        ),
+                    );
+                }
             }
             runtime
                 .cancel_settle_pending
@@ -3887,7 +3915,9 @@ impl AcpPool {
             // session/load 恢复，只丢掉在飞的那次工作）。首次 stall 不走到这里，
             // 因为无法从外部区分「query 卡死」与「Agent 在等长时后台任务」。
             sessions.remove(session_id);
-            drop(sessions);
+            // Keep the sessions lock across shutdown and the replacement spawn.
+            // Otherwise another resolver can observe the gap and start a second
+            // runtime for the same session; the later insert would leak it.
             runtime.shutdown().await;
             diagnostics::write(
                 &operation_id,
@@ -3899,7 +3929,6 @@ impl AcpPool {
             // 运行时建好后由它发出（见下面 insert 之后），这样也能区分「真的
             // 恢复了旧会话」与「只能新建会话」。
             restarted_after_stall = true;
-            sessions = self.sessions.lock().await;
         }
         // 与 spawn_session 一致走 self.backend()，让辅助索引缺失的会话在
         // acp_record 处得到明确报错，而不是误导性的「当前会话不是 ACP 会话」。
