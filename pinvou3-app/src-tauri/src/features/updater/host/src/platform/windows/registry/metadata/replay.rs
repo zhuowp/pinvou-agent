@@ -83,11 +83,7 @@ fn supplied<T>(
     })
 }
 
-fn decide(
-    batch: &TimeCheckedBatch<'_, '_, '_>,
-    index: &Index,
-    context: &Document,
-) -> Result<Decision> {
+fn decide(batch: &TimeCheckedBatch<'_, '_>, index: &Index, context: &Document) -> Result<Decision> {
     let selected_root = root(batch.root())?;
     if context.value()["product"].as_str() != Some(selected_root.product()) {
         return Err(Error::StateCorrupt);
@@ -133,11 +129,7 @@ fn decide(
     decision.map_err(|_| Error::StateCorrupt)
 }
 
-fn retain(
-    index: &mut Index,
-    decision: &Decision,
-    batch: &TimeCheckedBatch<'_, '_, '_>,
-) -> Result<()> {
+fn retain(index: &mut Index, decision: &Decision, batch: &TimeCheckedBatch<'_, '_>) -> Result<()> {
     let mut count = 0usize;
     let mut put = |raw: Vec<u8>| -> Result<()> {
         let hash = json::sha256(&raw);
@@ -158,6 +150,45 @@ fn retain(
     Ok(())
 }
 
+/// Shared batch verifier for live-owner and read-only catalog-member sources.
+/// It owns only ephemeral protected scratch and bounded denial knowledge.
+pub(super) struct Accumulator {
+    index: Index,
+    batches: u64,
+    required_role_denials: BTreeMap<String, Vec<String>>,
+}
+
+impl Accumulator {
+    pub(super) fn new(store: &Store) -> Result<Self> {
+        Ok(Self {
+            index: Index::new(store)?,
+            batches: 0,
+            required_role_denials: BTreeMap::new(),
+        })
+    }
+    pub(super) fn observe(
+        &mut self,
+        batch: &TimeCheckedBatch<'_, '_>,
+        context: &Document,
+    ) -> Result<()> {
+        if batch.index() != self.batches.checked_add(1).ok_or(Error::Unavailable)? {
+            return Err(Error::StateCorrupt);
+        }
+        super::policy::require_retained_denials(batch.role_denied(), &self.required_role_denials)?;
+        let decision = decide(batch, &self.index, context)?;
+        retain(&mut self.index, &decision, batch)?;
+        self.required_role_denials = batch.role_denied().clone();
+        self.batches = batch.index();
+        Ok(())
+    }
+    pub(super) fn batches(&self) -> u64 {
+        self.batches
+    }
+    pub(super) fn required_role_denials(&self) -> &BTreeMap<String, Vec<String>> {
+        &self.required_role_denials
+    }
+}
+
 #[allow(dead_code)]
 pub(in crate::platform::windows::registry) fn replay<'read, 'tx>(
     source: &'read LiveTimeReadSet<'tx>,
@@ -171,24 +202,15 @@ pub(in crate::platform::windows::registry) fn replay<'read, 'tx>(
         }),
         false,
     )?)?;
-    let mut index = Index::new(&Store::new(&host.context.seed))?;
-    let mut batches = 0u64;
-    let mut required_role_denials = BTreeMap::new();
-    let position = source.visit_metadata_time(host, |batch| {
-        if batch.index() != batches.checked_add(1).ok_or(Error::Unavailable)? {
-            return Err(Error::StateCorrupt);
-        }
-        super::policy::require_retained_denials(batch.role_denied(), &required_role_denials)?;
-        // No put is reachable before complete signature/graph/water success.
-        let decision = decide(batch, &index, &context)?;
-        retain(&mut index, &decision, batch)?;
-        // Monotonicity makes the last successful snapshot the complete bounded
-        // role knowledge. Keep historical verification on each batch's policy.
-        required_role_denials = batch.role_denied().clone();
-        batches = batch.index();
-        Ok(())
-    })?;
+    let mut accumulator = Accumulator::new(&Store::new(&host.context.seed))?;
+    let position =
+        source.visit_metadata_time(host, |batch| accumulator.observe(batch, &context))?;
     source.recheck(host)?;
+    let Accumulator {
+        index,
+        batches,
+        required_role_denials,
+    } = accumulator;
     // Every earlier error drops Index and its last transaction handle. Scratch
     // keys are rolled back; no partial Replay or committed index can escape.
     Ok(Replay {

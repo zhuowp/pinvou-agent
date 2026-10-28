@@ -4,7 +4,7 @@ use super::waterlog::StructuralBatch;
 use super::*;
 use crate::platform::windows::{
     installed::StartedServiceContext,
-    registry::time::{HistoricalSample, HistoricalTimeAnchor, LiveTimeReadSet},
+    registry::time::{HistoricalSample, LiveTimeReadSet},
 };
 use crate::trusted_time::UtcInterval;
 use std::collections::BTreeMap;
@@ -15,19 +15,26 @@ use std::collections::BTreeMap;
 pub(in crate::platform::windows::registry) struct HistoryPosition {
     head: Vec<u8>,
 }
+impl HistoryPosition {
+    pub(super) fn head_bytes(&self) -> &[u8] {
+        &self.head
+    }
+}
 
 /// A provisional batch with authenticated historical time, not a metadata
-/// acceptance result. Its native source and anchor borrow the same held TxR.
+/// acceptance result. The native row borrows the held TxR; the owned bounded
+/// observation remains DATA and is rechecked by its source-specific visitor.
 #[allow(dead_code)]
-pub(in crate::platform::windows::registry) struct TimeCheckedBatch<'batch, 'read, 'tx> {
+pub(in crate::platform::windows::registry) struct TimeCheckedBatch<'batch, 'tx> {
     batch: &'batch StructuralBatch<'tx>,
-    anchor: HistoricalTimeAnchor<'read, 'tx>,
+    state: crate::trusted_time::State,
+    root: Vec<u8>,
     interval: UtcInterval,
     role_denied: BTreeMap<String, Vec<String>>,
 }
 
 #[allow(dead_code)]
-impl TimeCheckedBatch<'_, '_, '_> {
+impl TimeCheckedBatch<'_, '_> {
     pub(in crate::platform::windows::registry) fn index(&self) -> u64 {
         self.batch.index()
     }
@@ -38,10 +45,10 @@ impl TimeCheckedBatch<'_, '_, '_> {
         self.interval
     }
     pub(in crate::platform::windows::registry) fn root(&self) -> &[u8] {
-        self.anchor.root()
+        &self.root
     }
     pub(in crate::platform::windows::registry) fn global_denied(&self) -> &[String] {
-        &self.anchor.state().denied_key_ids
+        &self.state.denied_key_ids
     }
     pub(in crate::platform::windows::registry) fn role_denied(
         &self,
@@ -59,25 +66,38 @@ impl TimeCheckedBatch<'_, '_, '_> {
     }
 }
 
-fn checked_batch<'batch, 'read, 'tx>(
+fn checked_observation<'batch, 'tx>(
     batch: &'batch StructuralBatch<'tx>,
-    source: &'read LiveTimeReadSet<'tx>,
-    host: &StartedServiceContext,
-) -> Result<TimeCheckedBatch<'batch, 'read, 'tx>> {
-    // The sample is obtained only from its actual native batch, pinned by the
-    // Record and complete protected Head chain; no raw-sample API is exposed.
-    let sample = HistoricalSample::parse(&batch.sample()?)?;
-    let anchor = source.historical_anchor(host, sample.revision(), sample.head_sha256())?;
-    let interval = anchor.verify_sample(host, &sample)?;
+    state: &crate::trusted_time::State,
+    root: &[u8],
+    interval: UtcInterval,
+) -> Result<TimeCheckedBatch<'batch, 'tx>> {
     let policy = batch.global_policy()?;
-    require_observation_policy(anchor.state(), &policy)?;
-    let roles = super::policy::Policy::parse(&batch.role_policy()?, &anchor.state().binding)?;
+    require_observation_policy(state, &policy)?;
+    let roles = super::policy::Policy::parse(&batch.role_policy()?, &state.binding)?;
     Ok(TimeCheckedBatch {
         batch,
-        anchor,
+        state: state.clone(),
+        root: root.to_vec(),
         interval,
         role_denied: roles.by_role(),
     })
+}
+
+fn with_live_batch(
+    batch: &StructuralBatch<'_>,
+    source: &LiveTimeReadSet<'_>,
+    host: &StartedServiceContext,
+    visit: impl FnOnce(&TimeCheckedBatch<'_, '_>) -> Result<()>,
+) -> Result<()> {
+    // Only the actual pinned native batch supplies the serialized sample.
+    let sample = HistoricalSample::parse(&batch.sample()?)?;
+    let anchor = source.historical_anchor(host, sample.revision(), sample.head_sha256())?;
+    let interval = anchor.verify_sample(host, &sample)?;
+    let checked = checked_observation(batch, anchor.state(), anchor.root(), interval)?;
+    visit(&checked)?;
+    // A visitor can own writable handles. Reauthenticate its historical source.
+    anchor.recheck(host)
 }
 
 fn require_observation_policy(state: &crate::trusted_time::State, raw: &[u8]) -> Result<()> {
@@ -98,7 +118,7 @@ pub(in crate::platform::windows::registry) fn visit_in(
     tx: &Handle,
     source: &LiveTimeReadSet<'_>,
     host: &StartedServiceContext,
-    mut visit: impl FnMut(&TimeCheckedBatch<'_, '_, '_>) -> Result<()>,
+    mut visit: impl FnMut(&TimeCheckedBatch<'_, '_>) -> Result<()>,
 ) -> Result<HistoryPosition> {
     source.require_metadata_transaction(private, tx)?;
     source.recheck(host)?;
@@ -110,23 +130,67 @@ pub(in crate::platform::windows::registry) fn visit_in(
     let metadata = open(private.0, NAMESPACE, false, Some(tx))?.ok_or(Error::SetupIncomplete)?;
     let head = waterlog::head_bytes_in(&metadata, &initial, tx)?;
     waterlog::visit_structure_in(&metadata, &initial, tx, |batch| {
-        let checked = checked_batch(batch, source, host)?;
-        visit(&checked)?;
-        // A callback can possess other writable handles in this transaction.
-        // Reauthenticate the entire historical prefix, not just current Head.
-        checked.anchor.recheck(host)
+        with_live_batch(batch, source, host, &mut visit)
     })?;
     // A later visitor may modify the time history used by an earlier batch.
     // The structural pass rechecks waterlog bytes; this second pass separately
     // reauthenticates every consumed historical time source without callbacks.
     waterlog::visit_structure_in(&metadata, &initial, tx, |batch| {
-        checked_batch(batch, source, host)?;
-        Ok(())
+        with_live_batch(batch, source, host, |_| Ok(()))
     })?;
     if waterlog::head_bytes_in(&metadata, &initial, tx)? != head {
         return Err(Error::ScopeConflict);
     }
     source.recheck(host)?;
+    Ok(HistoryPosition { head })
+}
+
+fn with_member_batch(
+    batch: &StructuralBatch<'_>,
+    member: &super::super::time::member_history::MemberTimeHistory<'_, '_>,
+    visit: impl FnOnce(&TimeCheckedBatch<'_, '_>) -> Result<()>,
+) -> Result<()> {
+    // The actual bound native batch is the only sample source here.
+    let observation = member.historical_observation(&batch.sample()?)?;
+    let checked = checked_observation(
+        batch,
+        observation.state(),
+        observation.root(),
+        observation.interval(),
+    )?;
+    visit(&checked)?;
+    observation.recheck()
+}
+
+/// Historical member DATA only; no running-service context is constructed.
+/// Both complete traversals use the member's actual private key and held TxR.
+pub(super) fn visit_member_in(
+    member: &super::super::time::member_history::MemberTimeHistory<'_, '_>,
+    initial: &[u8],
+    mut visit: impl FnMut(&TimeCheckedBatch<'_, '_>) -> Result<()>,
+) -> Result<HistoryPosition> {
+    member.recheck()?;
+    let tx = member.transaction();
+    let metadata =
+        open(member.private().0, NAMESPACE, false, Some(tx))?.ok_or(Error::SetupIncomplete)?;
+    if read(&metadata, "Genesis")? != initial {
+        return Err(Error::StateCorrupt);
+    }
+    let metadata_head = read(&metadata, "Head")?;
+    let head = waterlog::head_bytes_in(&metadata, initial, tx)?;
+    waterlog::visit_structure_in(&metadata, initial, tx, |batch| {
+        with_member_batch(batch, member, &mut visit)
+    })?;
+    waterlog::visit_structure_in(&metadata, initial, tx, |batch| {
+        with_member_batch(batch, member, |_| Ok(()))
+    })?;
+    if waterlog::head_bytes_in(&metadata, initial, tx)? != head
+        || read(&metadata, "Head")? != metadata_head
+        || read(&metadata, "Genesis")? != initial
+    {
+        return Err(Error::ScopeConflict);
+    }
+    member.recheck()?;
     Ok(HistoryPosition { head })
 }
 

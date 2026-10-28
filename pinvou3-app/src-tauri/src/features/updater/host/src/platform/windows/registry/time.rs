@@ -1,5 +1,6 @@
 //! Fixed native64 protected time sibling. Missing is never a fresh owner.
 //! Its genesis is created exclusively inside original Store::commit(None).
+pub(super) mod member_history;
 mod metadata_samples;
 mod policy_fault;
 pub(super) mod root_history;
@@ -1271,73 +1272,24 @@ impl<'tx> LiveTimeReadSet<'tx> {
     // Requires the same held guard and transaction as the source. This is
     // not an authorization boundary: callers must perform the SCM rechecks.
     fn replay_historical(&self, revision: u64, expected_sha256: &str) -> Result<(State, Vec<u8>)> {
-        if revision == 0
-            || revision > self.snapshot.state.revision
-            || !json::digest(expected_sha256)
-        {
-            return Err(Error::StateCorrupt);
-        }
-        let key = open(self.private.0, NAMESPACE, false, Some(self.transaction))?
-            .ok_or(Error::StateCorrupt)?;
-        let genesis = read(&key, "Genesis")?;
-        let expected = State::genesis(
-            self.snapshot.state.binding.clone(),
-            &self.snapshot.original_root,
-        )?;
-        if genesis != json::encode(&header(&expected), false)? {
-            return Err(Error::StateCorrupt);
-        }
-        let mut chain =
-            HistoricalHeaders::new(&self.snapshot.state.binding, &genesis, &self.snapshot.raw)?;
-        let history =
-            open(key.0, "history", false, Some(self.transaction))?.ok_or(Error::StateCorrupt)?;
-        exact_history_count(&history, self.snapshot.state.revision)?;
-        let mut previous: Option<(State, Vec<u8>)> = None;
-        let mut target = None;
-        for index in 1..=self.snapshot.state.revision {
-            super::super::time_cancel::check()?;
-            let row = open(
-                history.0,
-                &revision_name(index),
-                false,
-                Some(self.transaction),
-            )?
-            .ok_or(Error::StateCorrupt)?;
-            let raw = read(&row, "Record")?;
-            chain.observe(&raw)?;
-            let state = read_record_shape(&row, &raw)?;
-            let root = if state.product_root.is_some() {
+        member_history::replay_historical_source(
+            member_history::HistoricalSource {
+                private: self.private,
+                transaction: self.transaction,
+                binding: &self.snapshot.state.binding,
+                original: &self.snapshot.original_root,
+                head: &self.snapshot.raw,
+            },
+            Some((revision, expected_sha256)),
+            |state| {
                 self.verified_history
                     .as_ref()
                     .ok_or(Error::StateCorrupt)?
-                    .authenticate(&state)?
-            } else {
-                state.validate(&self.snapshot.original_root)?;
-                state.current_root(&self.snapshot.original_root).to_vec()
-            };
-            if let Some((prior, prior_raw)) = &previous {
-                if state.product_root.is_some() {
-                    prior.transition_compact_shape(&state, prior_raw)?;
-                } else {
-                    if prior.product_root.is_some() {
-                        return Err(Error::StateCorrupt);
-                    }
-                    prior.transition(&state, prior_raw, &self.snapshot.original_root)?;
-                }
-            }
-            if index == revision {
-                if json::sha256(&raw) != expected_sha256 {
-                    return Err(Error::StateCorrupt);
-                }
-                let evidence = state.evidence.as_ref().ok_or(Error::SourceUnavailable)?;
-                let incarnation = state.incarnation.as_ref().ok_or(Error::StateCorrupt)?;
-                state.anchor_for_live(evidence.policy.as_bytes(), incarnation)?;
-                target = Some((state.clone(), root));
-            }
-            previous = Some((state, raw));
-        }
-        chain.finish()?;
-        target.ok_or(Error::StateCorrupt)
+                    .authenticate(state)
+            },
+        )?
+        .selected
+        .ok_or(Error::StateCorrupt)
     }
 }
 
@@ -1346,6 +1298,17 @@ impl<'tx> LiveTimeReadSet<'tx> {
 /// successful signed historical observation or SCM authentication.
 #[cfg(feature = "metadata-component-tests")]
 pub(super) fn component_test_historical_genesis(source: &LiveTimeReadSet<'_>) -> Result<()> {
+    member_history::replay_historical_source(
+        member_history::HistoricalSource {
+            private: source.private,
+            transaction: source.transaction,
+            binding: &source.snapshot.state.binding,
+            original: &source.snapshot.original_root,
+            head: &source.snapshot.raw,
+        },
+        None,
+        |_| Err(Error::StateCorrupt),
+    )?;
     let digest = json::sha256(&source.snapshot.raw);
     if !matches!(
         source.replay_historical(1, &digest),
@@ -1391,6 +1354,7 @@ pub(super) fn component_test_historical_legacy<'a>(
     guard: &'a super::product_catalog::ProductGuard,
     tx: &'a Handle,
 ) -> Result<()> {
+    member_history::component_test_current(seed, host, guard, tx)?;
     use crate::{
         identity::{FileTime, ProcessSelector},
         monotonic::CounterObservation,

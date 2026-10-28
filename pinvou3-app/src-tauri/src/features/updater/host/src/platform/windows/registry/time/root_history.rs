@@ -5,6 +5,8 @@
 use super::*;
 use crate::trusted_time::{ProductRootBatch, ProductRootReplay};
 use sha2::{Digest, Sha256};
+mod prefix;
+pub(in crate::platform::windows::registry) use prefix::RootSignaturePrefix;
 
 #[cfg(feature = "metadata-component-tests")]
 static FAIL_EVIDENCE_AFTER_REQUEST: std::sync::atomic::AtomicBool =
@@ -650,20 +652,26 @@ pub(super) fn stage_next_in(
 /// Position resolved during complete replay; private fields prevent callers
 /// from constructing it from an unprotected member record. The owning read
 /// set must still recheck its guard, transaction and protected Head before use.
-pub(super) struct ReplayedPosition {
+pub(in crate::platform::windows::registry) struct ReplayedPosition {
     position: ProductRootPosition,
     root: Vec<u8>,
     binding: Binding,
     evidence: Option<Evidence>,
 }
 impl ReplayedPosition {
-    pub(super) fn matches(&self, expected: &ProductRootPosition) -> bool {
+    pub(in crate::platform::windows::registry) fn matches(
+        &self,
+        expected: &ProductRootPosition,
+    ) -> bool {
         self.position == *expected
     }
-    pub(super) fn root(&self) -> &[u8] {
+    pub(in crate::platform::windows::registry) fn root(&self) -> &[u8] {
         &self.root
     }
-    pub(super) fn authenticate_compact(&self, state: &State) -> Result<()> {
+    pub(in crate::platform::windows::registry) fn authenticate_compact(
+        &self,
+        state: &State,
+    ) -> Result<()> {
         state.validate_compact_shape()?;
         if state.product_root.as_ref() != Some(&self.position)
             || state.binding != self.binding
@@ -938,6 +946,7 @@ pub(super) struct VerifiedHistory<'a> {
     current_head: Vec<u8>,
     current_root: Vec<u8>,
     latest_issue: u64,
+    source_fingerprint: [u8; 32],
 }
 impl<'a> VerifiedHistory<'a> {
     pub(super) fn open(
@@ -953,12 +962,17 @@ impl<'a> VerifiedHistory<'a> {
             tx,
             |_, _| Ok(()),
         )?;
+        let source_fingerprint = prefix::fingerprint(seed, guard, tx)?;
         let current_head = protected_head_in(seed, tx)?;
         let (current_root, _, latest_issue) =
             replay_persisted_with_position_in(seed, guard, tx, None)?;
         if protected_head_in(seed, tx)? != current_head {
             return Err(Error::ScopeConflict);
         }
+        super::root_read_set::require_unchanged(
+            &source_fingerprint,
+            &prefix::fingerprint(seed, guard, tx)?,
+        )?;
         Ok(Self {
             seed,
             guard,
@@ -966,7 +980,12 @@ impl<'a> VerifiedHistory<'a> {
             current_head,
             current_root,
             latest_issue,
+            source_fingerprint,
         })
+    }
+    /// Root/time lineage only; metadata active-set authentication remains gated.
+    pub(super) fn prefix(&self) -> Result<RootSignaturePrefix<'a>> {
+        prefix::from_verified(self)
     }
     pub(super) fn check_context(
         &self,
@@ -1419,6 +1438,7 @@ pub(in crate::platform::windows::registry) fn component_test(
     };
     use std::sync::atomic::Ordering;
     let parent = create(private.0, "root-evidence-test", tx, false, true)?;
+    prefix::component_test_in(&parent, tx)?;
     let objects = create(parent.0, "objects", tx, false, true)?;
     write_object_in(&objects, &revision_name(1), tx, b"first")?;
     write_object_in(&objects, &revision_name(2), tx, b"second")?;

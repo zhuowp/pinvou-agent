@@ -1,36 +1,36 @@
 # Upgrade implementation progress
 
-2026-10-29 T27 publication candidate: a
-[native historical metadata owner](client-upgrade-metadata-publication.md)
-stages exact bounded originals, checks complete graphs against replayed waters,
-refreshes the actual same-source sample, and atomically journals originals,
-policies, active references and the trusted time floor. Commit/readback errors
-return Unknown; restart reads actual history. Cumulative role-deny rollback is
-rejected. The receipt is historical DATA, with no current-use or installation
-authority. Source review is in progress; full native pipeline execution remains
-blocked by registry RM error 6801, and no IPC/update-check route or Root promotion
-has been enabled. T27 remains incomplete. No E2E or deployment was run.
+2026-10-29 T27 current-member source candidate: the
+[protected catalog member metadata source](client-upgrade-member-metadata-source.md)
+shares complete historical time and graph/high-water replay with the live owner,
+then streams the latest accepted graph for every actual product member. Compact
+states use a transaction-bound authenticated Root signature-lineage prefix.
+This is a read-only historical DATA component under independent review. Root
+promotion, captured historical member metadata snapshots and the application
+update check remain incomplete. No E2E or deployment was run.
 
-2026-10-29 Windows T27 continuation candidate: the
-[native historical source component](client-upgrade-native-history.md) now
-connects actual same-transaction waterlog samples to historical signed time and
-full graph/high-water replay, with a protected never-committed scratch index.
-A cached historical anchor now reauthenticates earlier separated evidence
-before and after sample use. This remains a candidate under independent review;
-it is not production acceptance or T27 completion. Ordinary native Windows
-tests and the compile-only historical component fixture are available; direct
-HKCU TxR tests fail on this device with ERROR_RM_NOT_ACTIVE (6801). Production
-Root/write gates stay closed. No E2E or deployment was run.
+2026-10-29 delivered source components are stacked draft PRs: supplied metadata
+source decisions ([PR 1](https://github.com/zhuowp/pinvou-agent/pull/1)), native
+historical replay ([PR 2](https://github.com/zhuowp/pinvou-agent/pull/2)), and
+atomic checked-observation publication
+([PR 3](https://github.com/zhuowp/pinvou-agent/pull/3)). Their independent bounded
+source reviews are complete; this is not merge, release or full T27 acceptance.
+See [source decisions](client-upgrade-source-metadata.md),
+[native history](client-upgrade-native-history.md) and
+[publication](client-upgrade-metadata-publication.md) for component boundaries.
 
-2026-10-29 migration continuation: restored client-01 at `6fb672cec` and
-matched all 37 saved file SHA-256 digests. The isolated delivery scope is the
-[supplied source metadata component](client-upgrade-source-metadata.md): exact
-per-object reread binding and owned/source high-water decisions. Other restored
-Windows host/time/waterlog and CI edits remain uncommitted candidates. The
-component grants no production authority and does not complete T27. Root
-promotion and production metadata writes remain gated. No E2E or deployment was
-run. Detailed independent review and execution evidence is retained separately
-from this concise progress summary.
+The publication tree passed 301 native Windows host tests; two direct HKCU TxR
+tests failed at `RegCreateKeyTransactedW` with `ERROR_RM_NOT_ACTIVE` (6801), and
+two opt-in tests were ignored. Component fixtures compile but have not executed
+under working TxR. The fixture also does not exercise the full SCM-bound Store
+publication/restart pipeline. Hosted checks for PR 3 did not start because the
+GitHub account is locked due to billing; downstream checks skipped. No remote
+CI pass, production protected-runtime success or merge eligibility is claimed.
+
+Migration restored client-01 at `6fb672cec` and matched all 37 saved file hashes.
+Original archives and older client/server candidates remain preserved. Windows
+is the active platform; Linux/macOS upgrades and server candidates are parked.
+Detailed review and execution evidence is retained separately from this summary.
 
 T27 protocol verifier component: the streamed time verifier checks each supplied
 Root in order, including both transition thresholds and the maximum issued time

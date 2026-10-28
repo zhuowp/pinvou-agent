@@ -165,6 +165,7 @@ pub(crate) fn run_isolated() {
         .verify_initial_metadata(&seed, &reopened)
         .expect("recheck original initial intent");
     historical_genesis_uses_transacted_registry(&store, &seed, &reopened);
+    member_metadata_genesis_uses_actual_catalog(&store, &seed, &reopened);
     publication_staging_uses_transacted_registry(&store, &seed);
     waterlog_structure_uses_transacted_registry(&store, &seed, &reopened);
     if seed.original_root.sha256
@@ -291,6 +292,72 @@ fn historical_genesis_uses_transacted_registry(
     let source = super::time::current_in(&private, seed, host, &product, &tx).unwrap();
     super::time::component_test_historical_genesis(&source).unwrap();
     // Dropping the uncommitted transaction removes all damaged/extra rows.
+}
+
+/// Uses the real fixed catalog/profile source without constructing an SCM
+/// context. This one-member fixture does not prove cross-member interleavings
+/// or nonempty publication/restart. All deliberate mutations are rolled back.
+#[allow(unsafe_code)]
+fn member_metadata_genesis_uses_actual_catalog(
+    store: &Store,
+    seed: &Seed,
+    host: &HostRegistration,
+) {
+    let _profile = BootstrapGuard::acquire(seed, false).unwrap();
+    let product = product_catalog::ProductGuard::acquire(seed).unwrap();
+    let tx = Handle::owned(unsafe {
+        CreateTransaction(ptr::null_mut(), ptr::null_mut(), 0, 0, 0, 0, ptr::null())
+    })
+    .unwrap();
+    let private = store.key(true, Some(&tx)).unwrap().unwrap();
+    let metadata = open(private.0, "metadata-state-v1", true, Some(&tx))
+        .unwrap()
+        .unwrap();
+    let mut members = 0;
+    metadata::member_source::visit_metadata_members(seed, host, &product, &tx, None, |view| {
+        members += 1;
+        assert_eq!(view.member().host().digest()?, host.digest()?);
+        assert_eq!(view.batches(), 0);
+        let mut active = 0;
+        view.visit_active(|_, _| {
+            active += 1;
+            Ok(())
+        })?;
+        assert_eq!(
+            active, 0,
+            "only exact authenticated genesis proves an empty cache"
+        );
+        for name in ["Head", "Policy"] {
+            let original = read(&metadata, name)?;
+            write(&metadata, name, b"changed-after-view")?;
+            assert!(view.recheck().is_err());
+            write(&metadata, name, &original)?;
+            view.recheck()?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(members, 1, "fixture installs one actual protected member");
+    assert_eq!(
+        metadata::member_source::visit_metadata_members(seed, host, &product, &tx, None, |_| {
+            Err(Error::TimeCanceled)
+        }),
+        Err(Error::TimeCanceled),
+        "native visitor failure must survive full-source traversal"
+    );
+    let head = read(&metadata, "Head").unwrap();
+    let mut invoked = false;
+    assert!(
+        metadata::member_source::visit_metadata_members(seed, host, &product, &tx, None, |_| {
+            invoked = true;
+            write(&metadata, "Head", b"changed-before-factory-return")
+        })
+        .is_err()
+    );
+    assert!(invoked, "mutation assertion must execute its callback");
+    write(&metadata, "Head", &head).unwrap();
+    metadata::member_source::visit_metadata_members(seed, host, &product, &tx, None, |_| Ok(()))
+        .expect("restored source remains usable in the next traversal");
 }
 
 fn product_lock_contention(seed: &Seed) {

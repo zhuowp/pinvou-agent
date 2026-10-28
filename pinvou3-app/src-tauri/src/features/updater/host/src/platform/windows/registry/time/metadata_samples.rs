@@ -24,7 +24,7 @@ impl LiveTimeReadSet<'_> {
     pub(in crate::platform::windows::registry) fn visit_metadata_time(
         &self,
         host: &StartedServiceContext,
-        visit: impl FnMut(&TimeCheckedBatch<'_, '_, '_>) -> Result<()>,
+        visit: impl FnMut(&TimeCheckedBatch<'_, '_>) -> Result<()>,
     ) -> Result<HistoryPosition> {
         self.recheck(host)?;
         let position = time_history::visit_in(self.private, self.transaction, self, host, visit)?;

@@ -83,20 +83,32 @@ fn check_existing_in(
             .metadata
             .record_bytes(),
     )?;
+    check_bound_history_in(private, &initial, &Binding::from_host(host), tx)
+}
+
+/// Layout DATA for an independently authenticated native owner binding and
+/// bootstrap genesis. This is shared with the catalog-member reader; signature,
+/// time and water replay must still complete before using its observation.
+pub(super) fn check_bound_history_in(
+    private: &Key,
+    initial: &[u8],
+    binding: &Binding,
+    tx: &Handle,
+) -> Result<Vec<u8>> {
     let metadata = open(private.0, NAMESPACE, false, Some(tx))?.ok_or(Error::SetupIncomplete)?;
     exact_names(&names(&metadata, true, 3)?, &["Genesis", "Head", "Policy"])?;
     exact_names(&names(&metadata, false, 2)?, &["history", "waterlog"])?;
     if read(&metadata, "Genesis")? != initial {
         return Err(Error::StateCorrupt);
     }
-    policy::read_in(&metadata, &Binding::from_host(host))?;
+    policy::read_in(&metadata, binding)?;
     let history = open(metadata.0, "history", false, Some(tx))?.ok_or(Error::StateCorrupt)?;
     let first = open(history.0, &revision_name(1), false, Some(tx))?.ok_or(Error::StateCorrupt)?;
     waterlog::exact_counts(&first, 1, 0)?;
     if read(&first, "Record")? != initial {
         return Err(Error::StateCorrupt);
     }
-    let mut previous = initial.clone();
+    let mut previous = initial.to_vec();
     let mut count = 1u64;
     waterlog::visit_structure_in(&metadata, &initial, tx, |batch| {
         count = count.checked_add(1).ok_or(Error::Unavailable)?;
