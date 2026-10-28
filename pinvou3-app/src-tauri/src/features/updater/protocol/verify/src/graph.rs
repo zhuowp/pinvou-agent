@@ -3,15 +3,16 @@ use crate::{VerificationError, VerificationInputs, verify_with_supplied_root};
 use pinvou_upgrade_codec::{
     Document, InputKind, MetadataReferenceError, PublicGraphError, RootPolicyShape,
     SchemaCheckedEnvelope, SuppliedProtocolTime, assert_supplied_public_graph,
-    derive_metadata_reference,
+    assert_supplied_public_graph_source, derive_metadata_reference,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PublicChainError {
     Verification(VerificationError),
     Graph(PublicGraphError),
     InvalidInterval,
+    SourceUnavailable,
 }
 impl std::fmt::Display for PublicChainError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -19,8 +20,154 @@ impl std::fmt::Display for PublicChainError {
             Self::Verification(error) => error.fmt(f),
             Self::Graph(error) => error.fmt(f),
             Self::InvalidInterval => f.write_str("PUBLIC_CHAIN_INTERVAL_INVALID"),
+            Self::SourceUnavailable => f.write_str("PUBLIC_CHAIN_SOURCE_UNAVAILABLE"),
         }
     }
+}
+
+/// Result of checking the caller-supplied originals, not a protected source,
+/// committed state, trusted time, or installation authority. It retains only
+/// bounded reference data rather than the member originals.
+pub struct SignatureCheckedPublicSourceInterval {
+    member_count: usize,
+    earliest: f64,
+    latest: f64,
+}
+impl SignatureCheckedPublicSourceInterval {
+    pub fn member_count(&self) -> usize {
+        self.member_count
+    }
+    pub fn earliest_millis(&self) -> f64 {
+        self.earliest
+    }
+    pub fn latest_millis(&self) -> f64 {
+        self.latest
+    }
+}
+
+/// Verify an exact Snapshot member inventory by reading one bounded original at
+/// a time. Each repeated read is checked against the same reference and signed
+/// Snapshot; source errors are never converted into missing/empty objects.
+/// The caller must maintain an immutable protected source, authenticate Root,
+/// time and denials, and recheck them and atomic persistence before any use.
+/// The source must enforce the per-object byte limit before allocating each
+/// returned buffer; validation here cannot reverse an earlier allocation.
+/// If multiple inputs are invalid, the first error may differ from the slice
+/// API because source and endpoint checks run in a different order.
+pub fn verify_public_chain_source_interval(
+    timestamp_bytes: &[u8],
+    snapshot_bytes: &[u8],
+    member_count: usize,
+    mut read: impl FnMut(usize) -> Result<Vec<u8>, PublicChainError>,
+    inputs: PublicChainInputs<'_>,
+    latest: &SuppliedProtocolTime,
+) -> Result<SignatureCheckedPublicSourceInterval, PublicChainError> {
+    let earliest = inputs.now.as_millis();
+    let latest_millis = latest.as_millis();
+    if earliest > latest_millis {
+        return Err(PublicChainError::InvalidInterval);
+    }
+    let latest_inputs = PublicChainInputs {
+        root: inputs.root,
+        context: inputs.context,
+        now: latest,
+        denied: inputs.denied,
+        denied_by_role: inputs.denied_by_role.clone(),
+    };
+    let timestamp = verify_member(timestamp_bytes, "\"timestamp\"", "{}", &inputs)?;
+    let snapshot = verify_member(snapshot_bytes, "\"snapshot\"", "{}", &inputs)?;
+    let timestamp_last = verify_member(timestamp_bytes, "\"timestamp\"", "{}", &latest_inputs)?;
+    let snapshot_last = verify_member(snapshot_bytes, "\"snapshot\"", "{}", &latest_inputs)?;
+    parse(
+        timestamp.envelope().signed().value()["snapshot"]
+            .to_string()
+            .as_bytes(),
+    )?
+    .metadata_reference_shape()
+    .map_err(|e| PublicChainError::Graph(PublicGraphError::Reference(e)))?
+    .assert_original_envelope(snapshot_bytes)
+    .map_err(|e| PublicChainError::Graph(PublicGraphError::Reference(e)))?;
+    let entries = snapshot.envelope().signed().value()["entries"]
+        .as_array()
+        .ok_or(PublicChainError::Graph(PublicGraphError::InvalidFields))?;
+    if member_count > entries.len() {
+        return Err(PublicChainError::Graph(
+            PublicGraphError::MemberUnreferenced,
+        ));
+    }
+    // Bind each reference to the authenticated bounded Snapshot before
+    // retaining it; otherwise a hostile source could accumulate thousands of
+    // large, unrelated scopes before the graph comparison rejects them.
+    let mut declared = BTreeMap::new();
+    for entry in entries {
+        let expected = parse(entry.to_string().as_bytes())?
+            .metadata_reference_shape()
+            .map_err(|e| PublicChainError::Graph(PublicGraphError::Reference(e)))?;
+        let hash = entry["envelopeSha256"]
+            .as_str()
+            .ok_or(PublicChainError::Graph(PublicGraphError::InvalidFields))?;
+        if declared.insert(hash, expected).is_some() {
+            return Err(PublicChainError::Graph(PublicGraphError::MemberDuplicate));
+        }
+    }
+    let mut references = Vec::with_capacity(member_count);
+    let mut seen = BTreeSet::new();
+    for index in 0..member_count {
+        let raw = read(index)?;
+        let actual = derive_metadata_reference(&raw)
+            .map_err(|e| PublicChainError::Graph(PublicGraphError::Reference(e)))?;
+        let fields = parse(actual.canonical_bytes())?;
+        let hash = fields.value()["envelopeSha256"]
+            .as_str()
+            .ok_or(PublicChainError::Graph(PublicGraphError::InvalidFields))?;
+        let expected = declared.get(hash).ok_or(PublicChainError::Graph(
+            PublicGraphError::MemberUnreferenced,
+        ))?;
+        if actual.canonical_bytes() != expected.canonical_bytes() {
+            return Err(PublicChainError::Graph(PublicGraphError::Reference(
+                MetadataReferenceError::Mismatch,
+            )));
+        }
+        if !seen.insert(hash.to_owned()) {
+            return Err(PublicChainError::Graph(PublicGraphError::MemberDuplicate));
+        }
+        references.push(actual);
+    }
+    for (ts, sn, now_inputs) in [
+        (&timestamp, &snapshot, &inputs),
+        (&timestamp_last, &snapshot_last, &latest_inputs),
+    ] {
+        let mut failure = None;
+        let result =
+            assert_supplied_public_graph_source(ts, sn, &references, inputs.context, |index| {
+                let attempt = (|| {
+                    let raw = read(index)?;
+                    references[index]
+                        .assert_original_envelope(&raw)
+                        .map_err(|e| PublicChainError::Graph(PublicGraphError::Reference(e)))?;
+                    let reference = parse(references[index].canonical_bytes())?;
+                    verify_member(
+                        &raw,
+                        &reference.value()["role"].to_string(),
+                        &reference.value()["scope"].to_string(),
+                        now_inputs,
+                    )
+                })();
+                attempt.map_err(|error| {
+                    failure = Some(error);
+                    PublicGraphError::InvalidFields
+                })
+            });
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        result.map_err(PublicChainError::Graph)?;
+    }
+    Ok(SignatureCheckedPublicSourceInterval {
+        member_count,
+        earliest,
+        latest: latest_millis,
+    })
 }
 
 /// A complete chain checked over caller-supplied inclusive time bounds. These

@@ -1,7 +1,8 @@
 use base64::{Engine, engine::general_purpose::STANDARD};
 use pinvou_upgrade_codec::{Document, InputKind};
 use pinvou_upgrade_verifier::{
-    PublicChainError, PublicChainInputs, verify_public_chain, verify_public_chain_interval,
+    PublicChainError, PublicChainInputs, VerificationInputs, verify_public_chain,
+    verify_public_chain_interval, verify_public_chain_source_interval, verify_with_supplied_root,
 };
 use serde_json::Value;
 use std::{collections::BTreeMap, path::Path, process::Command, sync::OnceLock};
@@ -284,4 +285,449 @@ fn interval_requires_every_instant_to_be_inside_all_fresh_windows() {
 #[test]
 fn exact_policy_original_wire_and_production_package_rules() {
     check_group("wire_policy", 5);
+}
+
+#[test]
+fn source_interval_rechecks_actual_originals_across_graph_passes() {
+    let case = cases()
+        .iter()
+        .find(|c| c["name"] == "strong-signed-complete-positive")
+        .unwrap();
+    let root = document(&case["trustedRoot"]).root_policy_shape().unwrap();
+    let context = document(&case["context"]);
+    let now = document(&case["now"]).protocol_time_shape().unwrap();
+    let timestamp = STANDARD
+        .decode(case["timestamp"].as_str().unwrap())
+        .unwrap();
+    let snapshot = STANDARD.decode(case["snapshot"].as_str().unwrap()).unwrap();
+    let members: Vec<Vec<u8>> = case["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| STANDARD.decode(v.as_str().unwrap()).unwrap())
+        .collect();
+    let borrowed: Vec<_> = members.iter().map(Vec::as_slice).collect();
+    let inputs = || PublicChainInputs::new(&root, &context, &now);
+    let mut visits = vec![0usize; members.len()];
+    let checked = verify_public_chain_source_interval(
+        &timestamp,
+        &snapshot,
+        members.len(),
+        |i| {
+            visits[i] += 1;
+            Ok(members[i].clone())
+        },
+        inputs(),
+        &now,
+    )
+    .unwrap();
+    assert_eq!(checked.member_count(), members.len());
+    assert_eq!(checked.earliest_millis(), now.as_millis());
+    assert_eq!(checked.latest_millis(), now.as_millis());
+    assert!(
+        std::mem::size_of_val(&checked) <= 32,
+        "the returned proof retains no member bodies"
+    );
+    assert!(
+        visits.iter().all(|count| *count >= 3),
+        "both graph passes reload actual members"
+    );
+    assert!(verify_public_chain_interval(&timestamp, &snapshot, &borrowed, inputs(), &now).is_ok());
+    let mut calls = 0;
+    let failed = verify_public_chain_source_interval(
+        &timestamp,
+        &snapshot,
+        members.len(),
+        |i| {
+            calls += 1;
+            if calls > members.len() && i == 0 {
+                Err(PublicChainError::SourceUnavailable)
+            } else {
+                Ok(members[i].clone())
+            }
+        },
+        inputs(),
+        &now,
+    );
+    assert!(matches!(failed, Err(PublicChainError::SourceUnavailable)));
+    let mut reads = vec![0usize; members.len()];
+    assert!(
+        verify_public_chain_source_interval(
+            &timestamp,
+            &snapshot,
+            members.len(),
+            |i| {
+                reads[i] += 1;
+                Ok(if i == 0 && reads[i] > 1 {
+                    members[1].clone()
+                } else {
+                    members[i].clone()
+                })
+            },
+            inputs(),
+            &now
+        )
+        .is_err(),
+        "changed source cannot reuse the first reference"
+    );
+    assert!(
+        verify_public_chain_source_interval(
+            &timestamp,
+            &snapshot,
+            members.len() - 1,
+            |i| Ok(members[i].clone()),
+            inputs(),
+            &now
+        )
+        .is_err()
+    );
+    let mut duplicate_reads = 0;
+    assert!(matches!(
+        verify_public_chain_source_interval(
+            &timestamp,
+            &snapshot,
+            members.len(),
+            |i| {
+                duplicate_reads += 1;
+                Ok(members[if i == 1 { 0 } else { i }].clone())
+            },
+            inputs(),
+            &now
+        ),
+        Err(PublicChainError::Graph(
+            pinvou_upgrade_codec::PublicGraphError::MemberDuplicate
+        ))
+    ));
+    assert_eq!(
+        duplicate_reads, 2,
+        "duplicate references are refused before accumulating more input"
+    );
+    let release = members
+        .iter()
+        .find(|raw| serde_json::from_slice::<Value>(raw).unwrap()["signed"]["role"] == "release")
+        .unwrap();
+    let key = serde_json::from_slice::<Value>(release).unwrap()["signatures"][0]["keyId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        verify_public_chain_source_interval(
+            &timestamp,
+            &snapshot,
+            members.len(),
+            |i| Ok(members[i].clone()),
+            inputs().with_role_denied_key_ids("release", &[key]),
+            &now
+        )
+        .is_err()
+    );
+    let later = document(&serde_json::json!(case["now"].as_u64().unwrap() + 1))
+        .protocol_time_shape()
+        .unwrap();
+    assert!(matches!(
+        verify_public_chain_source_interval(
+            &timestamp,
+            &snapshot,
+            members.len(),
+            |i| Ok(members[i].clone()),
+            PublicChainInputs::new(&root, &context, &later),
+            &now
+        ),
+        Err(PublicChainError::InvalidInterval)
+    ));
+    let expired = document(&serde_json::json!(9_007_199_254_740_991_u64))
+        .protocol_time_shape()
+        .unwrap();
+    assert!(
+        verify_public_chain_source_interval(
+            &timestamp,
+            &snapshot,
+            members.len(),
+            |i| Ok(members[i].clone()),
+            inputs(),
+            &expired
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn source_accepts_large_independent_signed_members_without_returning_bodies() {
+    let root_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(7)
+        .unwrap();
+    let script = r#"
+      import {pathToFileURL} from 'node:url';
+      const ref=pathToFileURL(process.argv[1]);
+      const {createFixtureSet,NOW}=await import(new URL('./tests/fixtures.mjs',ref));
+      const {envelopeReference}=await import(ref);
+      const f=createFixtureSet(), pkg=f.sign(f.metadata.package), releases=[];
+      for(let i=0;i<8;i++) {
+        const r=structuredClone(f.metadata.release); r.scope.releaseId=`release-${i+20}`;
+        r.notes={'zh-CN':'a'.repeat(50000),en:'b'.repeat(50000),ja:'c'.repeat(50000)};
+        r.targets[0].packageManifest=envelopeReference(pkg); releases.push(f.sign(r));
+      }
+      const target=structuredClone(f.metadata.target);
+      target.baselineRelease=envelopeReference(releases[0]);
+      target.ordinaryPaths=releases.slice(1).map((r,i)=>({deploymentId:`deployment-${i+20}`,
+        deploymentRevision:1,approvalId:`approval-${i+20}`,approvalRevision:1,release:envelopeReference(r)}));
+      const members=[f.sign(target),...releases,pkg], snap=structuredClone(f.metadata.snapshot);
+      snap.entries=members.map(envelopeReference);
+      const snapshot=f.sign(snap), timestamp=structuredClone(f.metadata.timestamp);
+      timestamp.snapshot=envelopeReference(snapshot);
+      const b64=x=>Buffer.from(x).toString('base64');
+      console.log(JSON.stringify({root:f.metadata.root,context:{product:'pinvou',component:'app'},now:NOW,
+        timestamp:b64(f.sign(timestamp)),snapshot:b64(snapshot),members:members.map(b64)}));
+    "#;
+    let output = Command::new("node")
+        .args(["--input-type=module", "-e", script])
+        .arg(root_dir.join("specs/upgrade/v1/reference/signatures.mjs"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let case: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let root = document(&case["root"]).root_policy_shape().unwrap();
+    let context = document(&case["context"]);
+    let now = document(&case["now"]).protocol_time_shape().unwrap();
+    let decode = |v: &Value| STANDARD.decode(v.as_str().unwrap()).unwrap();
+    let timestamp = decode(&case["timestamp"]);
+    let snapshot = decode(&case["snapshot"]);
+    let members: Vec<Vec<u8>> = case["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(decode)
+        .collect();
+    assert!(members.iter().map(Vec::len).sum::<usize>() > 1024 * 1024);
+    assert!(members.iter().all(|item| item.len() <= 1024 * 1024));
+    let mut reads = 0;
+    let proof = verify_public_chain_source_interval(
+        &timestamp,
+        &snapshot,
+        members.len(),
+        |i| {
+            reads += 1;
+            Ok(members[i].clone())
+        },
+        PublicChainInputs::new(&root, &context, &now),
+        &now,
+    )
+    .unwrap();
+    assert_eq!(proof.member_count(), members.len());
+    assert!(reads > members.len() * 2);
+    assert!(std::mem::size_of_val(&proof) <= 32);
+}
+
+#[test]
+fn source_failure_or_replacement_on_second_time_endpoint_is_not_accepted() {
+    let case = cases()
+        .iter()
+        .find(|c| c["name"] == "strong-signed-complete-positive")
+        .unwrap();
+    let root = document(&case["trustedRoot"]).root_policy_shape().unwrap();
+    let context = document(&case["context"]);
+    let first = document(&case["now"]).protocol_time_shape().unwrap();
+    let last = document(&serde_json::json!(case["now"].as_u64().unwrap() + 1))
+        .protocol_time_shape()
+        .unwrap();
+    let timestamp = STANDARD
+        .decode(case["timestamp"].as_str().unwrap())
+        .unwrap();
+    let snapshot = STANDARD.decode(case["snapshot"].as_str().unwrap()).unwrap();
+    let members: Vec<Vec<u8>> = case["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| STANDARD.decode(v.as_str().unwrap()).unwrap())
+        .collect();
+    let mut order = Vec::new();
+    let checked = verify_public_chain_source_interval(
+        &timestamp,
+        &snapshot,
+        members.len(),
+        |i| {
+            order.push(i);
+            Ok(members[i].clone())
+        },
+        PublicChainInputs::new(&root, &context, &first),
+        &last,
+    )
+    .unwrap();
+    assert!(checked.latest_millis() > checked.earliest_millis());
+    let graph_reads = &order[members.len()..];
+    assert_eq!(graph_reads.len() % 2, 0);
+    let half = graph_reads.len() / 2;
+    assert!(half > 0);
+    assert_eq!(&graph_reads[..half], &graph_reads[half..]);
+    let high_first = members.len() + half;
+    let mut seen = 0;
+    let failed = verify_public_chain_source_interval(
+        &timestamp,
+        &snapshot,
+        members.len(),
+        |i| {
+            let current = seen;
+            seen += 1;
+            if current == high_first {
+                Err(PublicChainError::SourceUnavailable)
+            } else {
+                Ok(members[i].clone())
+            }
+        },
+        PublicChainInputs::new(&root, &context, &first),
+        &last,
+    );
+    assert!(matches!(failed, Err(PublicChainError::SourceUnavailable)));
+    let mut seen = 0;
+    let replaced = verify_public_chain_source_interval(
+        &timestamp,
+        &snapshot,
+        members.len(),
+        |i| {
+            let current = seen;
+            seen += 1;
+            Ok(if current == high_first {
+                members[(i + 1) % members.len()].clone()
+            } else {
+                members[i].clone()
+            })
+        },
+        PublicChainInputs::new(&root, &context, &first),
+        &last,
+    );
+    assert!(matches!(
+        replaced,
+        Err(PublicChainError::Graph(
+            pinvou_upgrade_codec::PublicGraphError::Reference(
+                pinvou_upgrade_codec::MetadataReferenceError::Mismatch
+            )
+        ))
+    ));
+}
+
+#[test]
+fn signed_oracle_acceptance_agrees_between_slice_and_source() {
+    for case in cases() {
+        let root = document(&case["trustedRoot"]).root_policy_shape().unwrap();
+        let context = document(&case["context"]);
+        let now = document(&case["now"]).protocol_time_shape().unwrap();
+        let timestamp = STANDARD
+            .decode(case["timestamp"].as_str().unwrap())
+            .unwrap();
+        let snapshot = STANDARD.decode(case["snapshot"].as_str().unwrap()).unwrap();
+        let members: Vec<Vec<u8>> = case["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| STANDARD.decode(v.as_str().unwrap()).unwrap())
+            .collect();
+        let borrowed: Vec<&[u8]> = members.iter().map(Vec::as_slice).collect();
+        let denied: Vec<String> = serde_json::from_value(case["deniedKeyIds"].clone()).unwrap();
+        let denied_by_role: BTreeMap<String, Vec<String>> =
+            serde_json::from_value(case["deniedKeyIdsByRole"].clone()).unwrap();
+        let input = || {
+            let mut inputs =
+                PublicChainInputs::new(&root, &context, &now).with_denied_key_ids(&denied);
+            for (role, ids) in &denied_by_role {
+                inputs = inputs.with_role_denied_key_ids(role, ids);
+            }
+            inputs
+        };
+        let slice =
+            verify_public_chain_interval(&timestamp, &snapshot, &borrowed, input(), &now).is_ok();
+        let source = verify_public_chain_source_interval(
+            &timestamp,
+            &snapshot,
+            members.len(),
+            |i| Ok(members[i].clone()),
+            input(),
+            &now,
+        )
+        .is_ok();
+        assert_eq!(
+            source, slice,
+            "source/slice acceptance differs for {}",
+            case["name"]
+        );
+    }
+}
+
+#[test]
+fn source_checks_member_expiry_at_second_endpoint_independently() {
+    let root_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(7)
+        .unwrap();
+    let script = r#"
+      import {pathToFileURL} from 'node:url';
+      const ref=pathToFileURL(process.argv[1]);
+      const {createFixtureSet,NOW}=await import(new URL('./tests/fixtures.mjs',ref));
+      const {envelopeReference}=await import(ref);
+      const f=createFixtureSet(), pkg=f.sign(f.metadata.package);
+      const release=structuredClone(f.metadata.release); release.targets[0].packageManifest=envelopeReference(pkg);
+      const releaseBytes=f.sign(release), target=structuredClone(f.metadata.target);
+      target.expiresAt=NOW+5; target.baselineRelease=envelopeReference(releaseBytes);
+      const members=[f.sign(target),releaseBytes,pkg], snap=structuredClone(f.metadata.snapshot);
+      snap.entries=members.map(envelopeReference); const snapshot=f.sign(snap);
+      const timestamp=structuredClone(f.metadata.timestamp); timestamp.snapshot=envelopeReference(snapshot);
+      const b64=x=>Buffer.from(x).toString('base64');
+      console.log(JSON.stringify({root:f.metadata.root,context:{product:'pinvou',component:'app'},now:NOW,
+        timestamp:b64(f.sign(timestamp)),snapshot:b64(snapshot),members:members.map(b64)}));
+    "#;
+    let output = Command::new("node")
+        .args(["--input-type=module", "-e", script])
+        .arg(root_dir.join("specs/upgrade/v1/reference/signatures.mjs"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let case: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let root = document(&case["root"]).root_policy_shape().unwrap();
+    let context = document(&case["context"]);
+    let now = case["now"].as_u64().unwrap();
+    let first = document(&serde_json::json!(now))
+        .protocol_time_shape()
+        .unwrap();
+    let before = document(&serde_json::json!(now + 4))
+        .protocol_time_shape()
+        .unwrap();
+    let expiry = document(&serde_json::json!(now + 5))
+        .protocol_time_shape()
+        .unwrap();
+    let decode = |v: &Value| STANDARD.decode(v.as_str().unwrap()).unwrap();
+    let timestamp = decode(&case["timestamp"]);
+    let snapshot = decode(&case["snapshot"]);
+    let members: Vec<Vec<u8>> = case["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(decode)
+        .collect();
+    let run = |last| {
+        verify_public_chain_source_interval(
+            &timestamp,
+            &snapshot,
+            members.len(),
+            |i| Ok(members[i].clone()),
+            PublicChainInputs::new(&root, &context, &first),
+            last,
+        )
+    };
+    assert!(run(&before).is_ok());
+    assert!(run(&expiry).is_err());
+    root.assert_supplied_current_window(&expiry).unwrap();
+    for (role, raw) in [("timestamp", &timestamp), ("snapshot", &snapshot)] {
+        let expected = document(
+            &serde_json::json!({"role":role,"product":"pinvou","component":"app","scope":{}}),
+        );
+        verify_with_supplied_root(raw, VerificationInputs::new(&root, &expected, &expiry)).unwrap();
+    }
 }

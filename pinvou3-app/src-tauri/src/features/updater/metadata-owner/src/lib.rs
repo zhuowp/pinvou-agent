@@ -4,7 +4,8 @@ mod binding;
 mod decision;
 pub use binding::BootstrapBinding;
 pub use decision::{
-    Decision, DecisionError, DecisionInputs, PriorWater, WaterUpdate, decide_public_metadata,
+    Decision, DecisionError, DecisionInputs, OwnedPriorWater, PriorWater, WaterUpdate,
+    decide_public_metadata, decide_public_metadata_owned, decide_public_metadata_source,
 };
 
 use pinvou_upgrade_codec::{Document, InputKind, decode_canonical_envelope};
