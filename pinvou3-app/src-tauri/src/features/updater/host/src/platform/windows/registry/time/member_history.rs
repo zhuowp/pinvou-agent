@@ -19,6 +19,7 @@ pub(super) struct HistoricalSource<'a> {
     pub(super) head: &'a [u8],
 }
 pub(super) struct HistoricalReplay {
+    // The semantic boundary state (current Head or captured ceiling).
     pub(super) current: State,
     pub(super) selected: Option<(State, Vec<u8>)>,
 }
@@ -29,11 +30,46 @@ pub(super) struct HistoricalReplay {
 pub(super) fn replay_historical_source(
     source: HistoricalSource<'_>,
     target: Option<(u64, &str)>,
+    resolve_compact: impl FnMut(&State) -> Result<Vec<u8>>,
+) -> Result<HistoricalReplay> {
+    replay_bound_source(source, ReplayBoundary::CurrentHead, target, resolve_compact)
+}
+
+/// Captured-ceiling DATA kernel only. Its caller must possess the authentic
+/// Root-member capture capability; supplying these bytes establishes no trust.
+/// `current` in the result is the CEILING state, never a future native state.
+pub(super) fn replay_historical_prefix_source(
+    source: HistoricalSource<'_>,
+    actual_head: &[u8],
+    target: Option<(u64, &str)>,
+    resolve_compact: impl FnMut(&State) -> Result<Vec<u8>>,
+) -> Result<HistoricalReplay> {
+    replay_bound_source(
+        source,
+        ReplayBoundary::CapturedCeiling { actual_head },
+        target,
+        resolve_compact,
+    )
+}
+
+enum ReplayBoundary<'a> {
+    CurrentHead,
+    CapturedCeiling { actual_head: &'a [u8] },
+}
+
+fn replay_bound_source(
+    source: HistoricalSource<'_>,
+    boundary: ReplayBoundary<'_>,
+    target: Option<(u64, &str)>,
     mut resolve_compact: impl FnMut(&State) -> Result<Vec<u8>>,
 ) -> Result<HistoricalReplay> {
+    let actual_head = match boundary {
+        ReplayBoundary::CurrentHead => source.head,
+        ReplayBoundary::CapturedCeiling { actual_head } => actual_head,
+    };
     let key = open(source.private.0, NAMESPACE, false, Some(source.transaction))?
         .ok_or(Error::StateCorrupt)?;
-    if read(&key, "Head")? != source.head {
+    if read(&key, "Head")? != actual_head {
         return Err(Error::ScopeConflict);
     }
     let genesis = read(&key, "Genesis")?;
@@ -41,12 +77,10 @@ pub(super) fn replay_historical_source(
     if genesis != json::encode(&header(&expected), false)? {
         return Err(Error::StateCorrupt);
     }
-    let mut chain = HistoricalHeaders::new(source.binding, &genesis, source.head)?;
-    if let Some((revision, hash)) = target {
-        if revision == 0 || revision > chain.head_revision || !json::digest(hash) {
-            return Err(Error::StateCorrupt);
-        }
-    }
+    let mut chain = HistoricalHeaders::new(source.binding, &genesis, actual_head)?;
+    let mut prefix = HistoricalHeaders::new(source.binding, &genesis, source.head)?;
+    let ceiling = prefix.head_revision;
+    require_target_boundary(ceiling, chain.head_revision, target)?;
     let history =
         open(key.0, "history", false, Some(source.transaction))?.ok_or(Error::StateCorrupt)?;
     exact_history_count(&history, chain.head_revision)?;
@@ -64,6 +98,12 @@ pub(super) fn replay_historical_source(
         let raw = read(&row, "Record")?;
         chain.observe(&raw)?;
         let state = read_record_shape(&row, &raw)?;
+        if index > ceiling {
+            // Bind the complete suffix header/payload shape, but never verify
+            // future Root/evidence semantics under the captured Root prefix.
+            continue;
+        }
+        prefix.observe(&raw)?;
         let root = if state.product_root.is_some() {
             resolve_compact(&state)?
         } else {
@@ -85,8 +125,31 @@ pub(super) fn replay_historical_source(
         }
         previous = Some((state, raw));
     }
+    prefix.finish()?;
     chain.finish()?;
-    if read(&key, "Head")? != source.head {
+    // No resolver callbacks in this pass: a later callback cannot leave an
+    // earlier row or separated payload damaged behind a stable native Head.
+    let mut second = HistoricalHeaders::new(source.binding, &genesis, actual_head)?;
+    exact_history_count(&history, second.head_revision)?;
+    for index in 1..=second.head_revision {
+        super::super::super::time_cancel::check()?;
+        let row = open(
+            history.0,
+            &revision_name(index),
+            false,
+            Some(source.transaction),
+        )?
+        .ok_or(Error::StateCorrupt)?;
+        let raw = read(&row, "Record")?;
+        second.observe(&raw)?;
+        if index == ceiling && raw != source.head {
+            return Err(Error::ScopeConflict);
+        }
+        let _ = read_record_shape(&row, &raw)?;
+    }
+    exact_history_count(&history, second.head_revision)?;
+    second.finish()?;
+    if read(&key, "Head")? != actual_head || read(&key, "Genesis")? != genesis {
         return Err(Error::ScopeConflict);
     }
     if target.is_some() && selected.is_none() {
@@ -98,6 +161,17 @@ pub(super) fn replay_historical_source(
     })
 }
 
+fn require_target_boundary(ceiling: u64, current: u64, target: Option<(u64, &str)>) -> Result<()> {
+    if ceiling == 0 || ceiling > current {
+        return Err(Error::StateCorrupt);
+    }
+    if let Some((revision, hash)) = target {
+        if revision == 0 || revision > ceiling || !json::digest(hash) {
+            return Err(Error::StateCorrupt);
+        }
+    }
+    Ok(())
+}
 fn select_observation(
     state: &State,
     raw: &[u8],
@@ -217,6 +291,24 @@ fn require_product_source(
 }
 
 impl<'prefix, 'tx> MemberTimeHistory<'prefix, 'tx> {
+    pub(in crate::platform::windows::registry) fn check_context(
+        &self,
+        seed: &Seed,
+        guard: &ProductGuard,
+        tx: &Handle,
+    ) -> Result<()> {
+        if !std::ptr::eq(self.seed, seed)
+            || !std::ptr::eq(self.guard, guard)
+            || !std::ptr::eq(self.transaction, tx)
+        {
+            return Err(Error::ScopeConflict);
+        }
+        guard.check_seed(seed)?;
+        if let Some(prefix) = self.prefix {
+            prefix.check_context(seed, guard, tx)?;
+        }
+        self.recheck()
+    }
     fn pins_fingerprint(&self) -> Result<[u8; 32]> {
         let mut hash = Sha256::new();
         hash.update(b"pinvou.product-member.current-time-pins.v1");
@@ -487,6 +579,7 @@ impl MemberHistoricalObservation<'_, '_, '_> {
 }
 
 #[cfg(feature = "metadata-component-tests")]
+#[allow(unsafe_code)]
 pub(super) fn component_test_current(
     seed: &Seed,
     requester: &HostRegistration,
@@ -524,13 +617,72 @@ pub(super) fn component_test_current(
             write(key, name, &saved)?;
             member.recheck()?;
         }
-        let history = open(time.0, "history", false, Some(tx))?.ok_or(Error::StateCorrupt)?;
+        let history = open(time.0, "history", true, Some(tx))?.ok_or(Error::StateCorrupt)?;
         let first =
             open(history.0, &revision_name(1), true, Some(tx))?.ok_or(Error::StateCorrupt)?;
         let saved = read(&first, "Record")?;
         write(&first, "Record", b"changed-old-row-with-same-head")?;
         assert!(member.recheck().is_err());
         write(&first, "Record", &saved)?;
+        // A captured ceiling remains readable after an appended future Root
+        // position. This synthetic suffix is HEADER DATA, never valid time.
+        let mut future: Header = json::decode(&member.head, false)?;
+        future.revision = future.revision.checked_add(1).ok_or(Error::Unavailable)?;
+        future.previous_sha256 = Some(json::sha256(&member.head));
+        future.product_root = Some(ProductRootPosition {
+            head_sha256: "f".repeat(64),
+            root_sha256: "e".repeat(64),
+            batch: 999,
+            root_count: 999,
+        });
+        let future_raw = json::encode(&future, false)?;
+        let future_name = revision_name(future.revision);
+        let future_row = create(history.0, &future_name, tx, false, true)?;
+        write(&future_row, "Record", &future_raw)?;
+        write(&time, "Head", &future_raw)?;
+        let input = || HistoricalSource {
+            private: member.private(),
+            transaction: tx,
+            binding: member.binding(),
+            original: member.original_root(),
+            head: &member.head,
+        };
+        let replay = replay_historical_prefix_source(input(), &future_raw, None, |_| {
+            Err(Error::StateCorrupt)
+        })?;
+        assert_eq!(replay.current.revision, member.state.revision);
+        assert!(
+            replay_historical_prefix_source(
+                input(),
+                &future_raw,
+                Some((future.revision, &json::sha256(&future_raw))),
+                |_| Err(Error::StateCorrupt)
+            )
+            .is_err()
+        );
+        write(&first, "Record", b"changed-old-row-with-same-current-head")?;
+        assert!(
+            replay_historical_prefix_source(input(), &future_raw, None, |_| Err(
+                Error::StateCorrupt
+            ))
+            .is_err()
+        );
+        write(&first, "Record", &saved)?;
+        drop(future_row);
+        assert_eq!(
+            unsafe {
+                RegDeleteKeyTransactedW(
+                    history.0,
+                    wide(&future_name).as_ptr(),
+                    KEY_WOW64_64KEY,
+                    0,
+                    tx.raw(),
+                    ptr::null(),
+                )
+            },
+            0
+        );
+        write(&time, "Head", &member.head)?;
         member.recheck()
     })?;
     if !found {
@@ -542,6 +694,17 @@ pub(super) fn component_test_current(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn captured_boundary_rejects_future_targets_and_wrong_digest_shape() {
+        let hash = "a".repeat(64);
+        assert!(require_target_boundary(2, 7, None).is_ok());
+        assert!(require_target_boundary(2, 7, Some((1, &hash))).is_ok());
+        assert!(require_target_boundary(2, 7, Some((2, &hash))).is_ok());
+        assert!(require_target_boundary(2, 7, Some((3, &hash))).is_err());
+        assert!(require_target_boundary(8, 7, None).is_err());
+        assert!(require_target_boundary(0, 7, None).is_err());
+        assert!(require_target_boundary(2, 7, Some((1, "invalid"))).is_err());
+    }
     #[test]
     fn unknown_genesis_is_valid_history_but_not_a_historical_observation() {
         let root = include_bytes!(concat!(

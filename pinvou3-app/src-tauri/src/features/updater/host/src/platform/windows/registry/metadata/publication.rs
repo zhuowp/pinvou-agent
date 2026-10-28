@@ -127,6 +127,46 @@ pub(super) fn check_bound_history_in(
     Ok(previous)
 }
 
+/// Retained prefix layout DATA only. The caller must authenticate both supplied
+/// Heads and the captured policy separately; today's Policy is only checked as
+/// part of today's native layout and never substitutes for a captured policy.
+pub(super) fn check_bound_history_prefix_in(
+    private: &Key,
+    initial: &[u8],
+    binding: &Binding,
+    tx: &Handle,
+    expected_metadata_head: &[u8],
+    expected_waterlog_head: &[u8],
+) -> Result<()> {
+    let current_head = check_bound_history_in(private, initial, binding, tx)?;
+    let metadata = open(private.0, NAMESPACE, false, Some(tx))?.ok_or(Error::StateCorrupt)?;
+    let current_policy = policy::read_in(&metadata, binding)?.1;
+    let current_waterlog_head = waterlog::head_bytes_in(&metadata, initial, tx)?;
+    let history = open(metadata.0, "history", false, Some(tx))?.ok_or(Error::StateCorrupt)?;
+    let mut previous = initial.to_vec();
+    let mut revision = 1u64;
+    waterlog::visit_structure_prefix_in(&metadata, initial, tx, expected_waterlog_head, |batch| {
+        revision = revision.checked_add(1).ok_or(Error::Unavailable)?;
+        let row = open(history.0, &revision_name(revision), false, Some(tx))?
+            .ok_or(Error::StateCorrupt)?;
+        waterlog::exact_counts(&row, 1, 0)?;
+        let raw = read(&row, "Record")?;
+        require_record(&raw, &previous, batch.position(initial)?)?;
+        previous = raw;
+        Ok(())
+    })?;
+    if previous != expected_metadata_head {
+        return Err(Error::StateCorrupt);
+    }
+    if check_bound_history_in(private, initial, binding, tx)? != current_head
+        || waterlog::head_bytes_in(&metadata, initial, tx)? != current_waterlog_head
+        || policy::read_in(&metadata, binding)?.1 != current_policy
+    {
+        return Err(Error::ScopeConflict);
+    }
+    Ok(())
+}
+
 /// Historical DATA only. The host borrow prevents a receipt from being moved
 /// into an unrelated service lifetime; it is not a permission capability.
 pub(in crate::platform::windows) struct Receipt<'host> {

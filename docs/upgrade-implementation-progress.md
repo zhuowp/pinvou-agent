@@ -1,11 +1,22 @@
 # Upgrade implementation progress
 
-2026-10-29 T27 current-member source candidate: the
+2026-10-29 T27 captured-prefix candidate: explicit
+[V2 member metadata witnesses](client-upgrade-captured-metadata-prefix.md)
+bind historical publication/waterlog ceilings and policies to actual Root batch
+members. Retained native prefixes share graph/time/water replay, and a separate
+batch traversal checks their latest graphs against the batch's signed final
+Root. Whole-member before/callback/after censuses also pin retained profiles.
+V1 remains lineage DATA and cannot imply empty metadata. This candidate is not
+yet delivered or independently reviewed. Root publisher integration, nonempty
+native pipeline execution and application update check remain incomplete.
+Production Root gates stay closed. No E2E or deployment was run.
+
+2026-10-29 delivered current-member source ([PR 4](https://github.com/zhuowp/pinvou-agent/pull/4)): the
 [protected catalog member metadata source](client-upgrade-member-metadata-source.md)
 shares complete historical time and graph/high-water replay with the live owner,
 then streams the latest accepted graph for every actual product member. Compact
 states use a transaction-bound authenticated Root signature-lineage prefix.
-This is a read-only historical DATA component under independent review. Root
+The fixed component source review closed after the cross-member census repair. Root
 promotion, captured historical member metadata snapshots and the application
 update check remain incomplete. No E2E or deployment was run.
 

@@ -194,6 +194,58 @@ pub(super) fn visit_member_in(
     Ok(HistoryPosition { head })
 }
 
+/// Samples come from the actual retained native prefix authenticated by the
+/// enclosing Root-member witness. Later native batches are not historical time
+/// authority for this ceiling; the structural worker separately pins them.
+pub(super) fn visit_captured_in(
+    source: &super::super::time::captured_history::CapturedMemberTimeHistory<'_, '_, '_>,
+    mut visit: impl FnMut(&TimeCheckedBatch<'_, '_>) -> Result<()>,
+) -> Result<HistoryPosition> {
+    source.recheck()?;
+    let pins = source.metadata_pins();
+    let tx = source.transaction();
+    let metadata =
+        open(source.private().0, NAMESPACE, false, Some(tx))?.ok_or(Error::SetupIncomplete)?;
+    if read(&metadata, "Genesis")? != pins.genesis {
+        return Err(Error::StateCorrupt);
+    }
+    let current_head = read(&metadata, "Head")?;
+    let mut with_batch = |batch: &StructuralBatch<'_>, callbacks: bool| -> Result<()> {
+        let observation = source.historical_observation(&batch.sample()?)?;
+        let checked = checked_observation(
+            batch,
+            observation.state(),
+            observation.root(),
+            observation.interval(),
+        )?;
+        if callbacks {
+            visit(&checked)?;
+        }
+        observation.recheck()
+    };
+    waterlog::visit_structure_prefix_in(
+        &metadata,
+        &pins.genesis,
+        tx,
+        &pins.waterlog_head,
+        |batch| with_batch(batch, true),
+    )?;
+    waterlog::visit_structure_prefix_in(
+        &metadata,
+        &pins.genesis,
+        tx,
+        &pins.waterlog_head,
+        |batch| with_batch(batch, false),
+    )?;
+    if read(&metadata, "Genesis")? != pins.genesis || read(&metadata, "Head")? != current_head {
+        return Err(Error::ScopeConflict);
+    }
+    source.recheck()?;
+    Ok(HistoryPosition {
+        head: pins.waterlog_head.clone(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

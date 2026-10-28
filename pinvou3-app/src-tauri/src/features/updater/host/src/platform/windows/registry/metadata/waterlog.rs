@@ -257,6 +257,29 @@ pub(super) fn visit_structure_in(
     metadata: &Key,
     genesis: &[u8],
     tx: &Handle,
+    visit: impl FnMut(&StructuralBatch<'_>) -> Result<()>,
+) -> Result<()> {
+    visit_structure_bound_in(metadata, genesis, tx, None, visit)
+}
+
+/// Historical prefix DATA only. Authenticate the complete current structural
+/// source, but expose batches only through the exact supplied retained Head.
+/// The enclosing owner must independently authenticate that Head's provenance.
+pub(super) fn visit_structure_prefix_in(
+    metadata: &Key,
+    genesis: &[u8],
+    tx: &Handle,
+    expected_head: &[u8],
+    visit: impl FnMut(&StructuralBatch<'_>) -> Result<()>,
+) -> Result<()> {
+    visit_structure_bound_in(metadata, genesis, tx, Some(expected_head), visit)
+}
+
+fn visit_structure_bound_in(
+    metadata: &Key,
+    genesis: &[u8],
+    tx: &Handle,
+    expected_head: Option<&[u8]>,
     mut visit: impl FnMut(&StructuralBatch<'_>) -> Result<()>,
 ) -> Result<()> {
     let key = open(metadata.0, "waterlog", false, Some(tx))?.ok_or(Error::StateCorrupt)?;
@@ -269,6 +292,16 @@ pub(super) fn visit_structure_in(
     let head = parse_head(&head_raw, genesis)?;
     if head.count == 0 && head_raw != initial {
         return Err(Error::StateCorrupt);
+    }
+    let prefix = expected_head
+        .map(|raw| parse_head(raw, genesis))
+        .transpose()?;
+    if let Some(prefix) = &prefix {
+        if prefix.count > head.count
+            || (prefix.count == 0 && expected_head != Some(initial.as_slice()))
+        {
+            return Err(Error::StateCorrupt);
+        }
     }
     let entries = open(key.0, "entries", false, Some(tx))?.ok_or(Error::StateCorrupt)?;
     exact_counts(&entries, 0, head.count)?;
@@ -283,7 +316,9 @@ pub(super) fn visit_structure_in(
         let members = open(row.0, "members", false, Some(tx))?.ok_or(Error::StateCorrupt)?;
         let batch = load_batch(row, members, tx, record)?;
         batch.verify_objects()?;
-        visit(&batch)?;
+        if prefix.as_ref().is_none_or(|prefix| index <= prefix.count) {
+            visit(&batch)?;
+        }
         // Recheck after visitor reads: all source objects and ordering must
         // still match before the provisional batch can advance.
         batch.verify_objects()?;
@@ -292,6 +327,7 @@ pub(super) fn visit_structure_in(
             return Err(Error::ScopeConflict);
         }
         previous = json::sha256(&raw);
+        require_prefix_terminal(prefix.as_ref(), index, &previous)?;
     }
     if head.count > 0 && head.last_record_sha256.as_deref() != Some(previous.as_str()) {
         return Err(Error::StateCorrupt);
@@ -314,12 +350,24 @@ pub(super) fn visit_structure_in(
         let members = open(row.0, "members", false, Some(tx))?.ok_or(Error::StateCorrupt)?;
         load_batch(row, members, tx, record)?.verify_objects()?;
         second_previous = json::sha256(&raw);
+        require_prefix_terminal(prefix.as_ref(), index, &second_previous)?;
     }
     if second_previous != previous {
         return Err(Error::ScopeConflict);
     }
-    if read(&key, "Head")? != head_raw {
+    exact_counts(&key, 2, 1)?;
+    exact_counts(&entries, 0, head.count)?;
+    if read(&key, "Head")? != head_raw || read(&key, "Genesis")? != initial {
         return Err(Error::ScopeConflict);
+    }
+    Ok(())
+}
+
+fn require_prefix_terminal(prefix: Option<&Head>, index: u64, digest: &str) -> Result<()> {
+    if let Some(prefix) = prefix {
+        if prefix.count == index && prefix.last_record_sha256.as_deref() != Some(digest) {
+            return Err(Error::StateCorrupt);
+        }
     }
     Ok(())
 }
@@ -367,7 +415,8 @@ pub(super) fn component_test_structure_in(
         count: 1,
         last_record_sha256: Some(json::sha256(&raw)),
     };
-    write(&key, "Head", &json::encode(&head, false)?)?;
+    let captured_head = json::encode(&head, false)?;
+    write(&key, "Head", &captured_head)?;
     let mut visited = 0;
     visit_structure_in(metadata, genesis, tx, |batch| {
         if batch.index() != 1 || batch.count() != 1 || batch.member(1)? != b"member" {
@@ -425,6 +474,22 @@ pub(super) fn component_test_structure_in(
     };
     write(&key, "Head", &json::encode(&second_head, false)?)?;
     visit_structure_in(metadata, genesis, tx, |_| Ok(()))?;
+    let mut prefix_visits = 0;
+    visit_structure_prefix_in(metadata, genesis, tx, &captured_head, |batch| {
+        assert_eq!(batch.index(), 1);
+        prefix_visits += 1;
+        Ok(())
+    })?;
+    assert_eq!(prefix_visits, 1);
+    visit_structure_prefix_in(metadata, genesis, tx, &empty_head(genesis)?, |_| {
+        Err(Error::StateCorrupt)
+    })?;
+    write(&second, "Timestamp", b"bad-suffix")?;
+    assert!(
+        visit_structure_prefix_in(metadata, genesis, tx, &empty_head(genesis)?, |_| Ok(()))
+            .is_err()
+    );
+    write(&second, "Timestamp", b"timestamp")?;
     if visit_structure_in(metadata, genesis, tx, |batch| {
         if batch.index() == 2 {
             write(&row, "Timestamp", b"late mutation")?;
@@ -567,6 +632,19 @@ mod tests {
         assert_eq!(count_result(0, 1, 0), Err(Error::StateCorrupt));
         assert_eq!(count_result(0, 0, 1), Err(Error::StateCorrupt));
         assert_eq!(count_result(5, 0, 0), Err(Error::Unavailable));
+    }
+    #[test]
+    fn retained_prefix_terminal_is_exact_and_does_not_deny_a_suffix() {
+        let prefix = Head {
+            waterlog_version: 1,
+            metadata_genesis_sha256: "a".repeat(64),
+            count: 2,
+            last_record_sha256: Some("b".repeat(64)),
+        };
+        assert!(require_prefix_terminal(Some(&prefix), 1, &"c".repeat(64)).is_ok());
+        assert!(require_prefix_terminal(Some(&prefix), 2, &"b".repeat(64)).is_ok());
+        assert!(require_prefix_terminal(Some(&prefix), 2, &"c".repeat(64)).is_err());
+        assert!(require_prefix_terminal(Some(&prefix), 3, &"c".repeat(64)).is_ok());
     }
     #[test]
     fn structural_head_and_member_chain_reject_reordering_and_wrong_binding() {

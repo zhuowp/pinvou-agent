@@ -6,7 +6,9 @@ use super::*;
 use crate::trusted_time::{ProductRootBatch, ProductRootReplay};
 use sha2::{Digest, Sha256};
 mod prefix;
-pub(in crate::platform::windows::registry) use prefix::RootSignaturePrefix;
+#[cfg(feature = "metadata-component-tests")]
+pub(in crate::platform::windows::registry) use prefix::component_test_captured_prefix;
+pub(in crate::platform::windows::registry) use prefix::{CapturedRootMember, RootSignaturePrefix};
 
 #[cfg(feature = "metadata-component-tests")]
 static FAIL_EVIDENCE_AFTER_REQUEST: std::sync::atomic::AtomicBool =
@@ -935,11 +937,13 @@ fn position_from_verified_prefix(
     })
 }
 
-/// A fully replayed product history tied to the caller's actual transaction
+/// A replayed product Root/time lineage tied to the caller's actual transaction
 /// and product guard. It cannot be constructed by a member record or outlive
 /// those native resources. The owner must recheck its complete read set before
-/// using any result as authority.
-pub(super) struct VerifiedHistory<'a> {
+/// using any result as authority. V2 metadata prefixes and final-Root active
+/// binding require the separate prefix.verify_all_metadata traversal; this
+/// lineage object alone does not attest to metadata completeness.
+pub(in crate::platform::windows::registry) struct VerifiedHistory<'a> {
     seed: &'a Seed,
     guard: &'a super::super::product_catalog::ProductGuard,
     tx: &'a Handle,

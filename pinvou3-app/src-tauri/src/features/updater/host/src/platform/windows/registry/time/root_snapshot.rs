@@ -3,9 +3,11 @@
 //! a complete, protected product history and replayed by its transaction owner.
 #![allow(dead_code)]
 
+use super::super::metadata::member_source::{CapturedMetadataPins, MemberMetadataView};
 use super::super::product_catalog::exact;
 use super::*;
 use crate::product_catalog::Event;
+mod metadata;
 
 #[cfg(feature = "metadata-component-tests")]
 pub(in crate::platform::windows::registry) static FAIL_AFTER_ENROLLMENT:
@@ -22,6 +24,24 @@ struct Record {
     policy: Blob,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     catchup: Option<Blob>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    metadata: Option<metadata::Descriptor>,
+}
+
+fn require_version(version: u8, metadata: bool) -> Result<()> {
+    match (version, metadata) {
+        (1, false) | (2, true) => Ok(()),
+        _ => Err(Error::StateCorrupt),
+    }
+}
+
+fn parse_record(raw: &[u8]) -> Result<Record> {
+    let record: Record = json::decode(raw, false)?;
+    require_version(record.version, record.metadata.is_some())?;
+    if json::encode(&record, false)? != raw {
+        return Err(Error::StateCorrupt);
+    }
+    Ok(record)
 }
 
 /// Both independently validated lists must be visited for this member. Keeping
@@ -55,7 +75,7 @@ pub(in crate::platform::windows::registry) fn capture_in(
     host: &HostRegistration,
     tx: &Handle,
 ) -> Result<Vec<u8>> {
-    capture_state_in(parent, name, seed, event, host, tx, None)
+    capture_state_in(parent, name, seed, event, host, tx, None, None)
 }
 
 /// Capture an already authenticated product member from the same guarded
@@ -70,7 +90,54 @@ pub(super) fn capture_history_in(
     tx: &Handle,
     verified: &super::root_history::VerifiedHistory<'_>,
 ) -> Result<Vec<u8>> {
-    capture_state_in(parent, name, seed, event, host, tx, Some((guard, verified)))
+    capture_state_in(
+        parent,
+        name,
+        seed,
+        event,
+        host,
+        tx,
+        Some((guard, verified)),
+        None,
+    )
+}
+
+/// Capture actual authenticated current metadata pins into the same TxR as the
+/// member's time pre-state. Only sibling staging outside the product subtree
+/// may be used while a full-product Root prefix is held. This never commits.
+pub(in crate::platform::windows::registry) fn capture_metadata_in(
+    parent: &Key,
+    name: &str,
+    seed: &Seed,
+    event: &Event,
+    host: &HostRegistration,
+    guard: &super::super::product_catalog::ProductGuard,
+    tx: &Handle,
+    verified: Option<&super::root_history::VerifiedHistory<'_>>,
+    view: &MemberMetadataView<'_, '_, '_>,
+) -> Result<Vec<u8>> {
+    view.member().check_context(seed, guard, tx)?;
+    view.recheck()?;
+    if json::encode(view.member().event(), false)? != json::encode(event, false)?
+        || view.member().host().digest()? != host.digest()?
+    {
+        return Err(Error::ScopeConflict);
+    }
+    if let Some(verified) = verified {
+        verified.check_context(seed, guard, tx)?;
+    }
+    let raw = capture_state_in(
+        parent,
+        name,
+        seed,
+        event,
+        host,
+        tx,
+        verified.map(|verified| (guard, verified)),
+        Some(view),
+    )?;
+    view.recheck()?;
+    Ok(raw)
 }
 
 /// Validate the issuer's proposed transition in the publishing transaction,
@@ -100,7 +167,7 @@ pub(super) fn capture_issuer_in(
         .transition(proposed, &current.raw, &current.original_root)?;
     // Bind the pre-state. Including the proposed state would make its own
     // product Head reference part of the digest that defines that Head.
-    capture_state_in(parent, name, seed, event, host, tx, None)
+    capture_state_in(parent, name, seed, event, host, tx, None, None)
 }
 
 fn capture_state_in(
@@ -114,6 +181,7 @@ fn capture_state_in(
         &super::super::product_catalog::ProductGuard,
         &super::root_history::VerifiedHistory<'_>,
     )>,
+    metadata_view: Option<&MemberMetadataView<'_, '_, '_>>,
 ) -> Result<Vec<u8>> {
     let path = format!(
         "Software\\Pinvou\\{}\\{}\\private",
@@ -139,6 +207,17 @@ fn capture_state_in(
     let enrollment = json::encode(event, false)?;
     let host_raw = json::encode(host, false)?;
     let state_raw = json::encode(&header(state), false)?;
+    let metadata_pins = metadata_view
+        .map(|view| {
+            if json::encode(&header(view.member().current_state()), false)? != state_raw
+                || view.member().original_root() != snapshot.original_root
+                || view.member().current_policy_raw() != policy.raw
+            {
+                return Err(Error::ScopeConflict);
+            }
+            view.snapshot_pins()
+        })
+        .transpose()?;
     let catchup = if history.is_some() && event.profile_id == seed.profile_id {
         let position = super::root_history::staged_position(
             &super::root_history::protected_head_in(seed, tx)?,
@@ -154,13 +233,14 @@ fn capture_state_in(
         None
     };
     let record = Record {
-        version: 1,
+        version: if metadata_pins.is_some() { 2 } else { 1 },
         enrollment: Blob::of(&enrollment),
         host: Blob::of(&host_raw),
         original: Blob::of(&snapshot.original_root),
         state: Blob::of(&state_raw),
         policy: Blob::of(&policy.raw),
         catchup: catchup.as_ref().map(|raw| Blob::of(raw)),
+        metadata: metadata_pins.as_ref().map(metadata::Descriptor::of),
     };
     let raw = json::encode(&record, false)?;
     let key = create(parent.0, name, tx, false, true)?;
@@ -179,8 +259,14 @@ fn capture_state_in(
     if let Some(catchup) = catchup {
         write(&key, "Catchup", &catchup)?;
     }
+    if let Some(pins) = &metadata_pins {
+        metadata::write_in(&key, pins)?;
+    }
     write(&key, "Record", &raw)?;
     read_shape_in(&key, tx, &raw)?.replay_input()?;
+    if let Some(view) = metadata_view {
+        view.recheck()?;
+    }
     Ok(raw)
 }
 
@@ -211,7 +297,60 @@ pub(super) struct UnverifiedMember {
     state: State,
     original: Vec<u8>,
     catchup: Option<CatchupRecord>,
+    event: Event,
+    host: HostRegistration,
+    metadata: Option<CapturedMetadataPins>,
 }
+
+/// Snapshot DATA only. The Root owner must authenticate the enclosing member
+/// chain and exact native batch before using this in a historical source.
+pub(in crate::platform::windows::registry) struct CapturedData {
+    event: Event,
+    host: HostRegistration,
+    original: Vec<u8>,
+    state: State,
+    global_policy_raw: Vec<u8>,
+    metadata: CapturedMetadataPins,
+}
+impl CapturedData {
+    pub(in crate::platform::windows::registry) fn event(&self) -> &Event {
+        &self.event
+    }
+    pub(in crate::platform::windows::registry) fn host(&self) -> &HostRegistration {
+        &self.host
+    }
+    pub(in crate::platform::windows::registry) fn original(&self) -> &[u8] {
+        &self.original
+    }
+    pub(in crate::platform::windows::registry) fn state(&self) -> &State {
+        &self.state
+    }
+    pub(in crate::platform::windows::registry) fn global_policy_raw(&self) -> &[u8] {
+        &self.global_policy_raw
+    }
+    pub(in crate::platform::windows::registry) fn metadata(&self) -> &CapturedMetadataPins {
+        &self.metadata
+    }
+}
+
+pub(in crate::platform::windows::registry) fn read_captured_in(
+    key: &Key,
+    tx: &Handle,
+    expected: &[u8],
+) -> Result<CapturedData> {
+    let member = read_shape_in(key, tx, expected)?;
+    // Recognized V1 is lineage DATA, never an assertion of empty metadata.
+    let metadata = member.metadata.ok_or(Error::SourceUnavailable)?;
+    Ok(CapturedData {
+        event: member.event,
+        host: member.host,
+        original: member.original,
+        state: member.state,
+        global_policy_raw: member.denials.policy_raw,
+        metadata,
+    })
+}
+
 impl UnverifiedMember {
     pub(super) fn catchup(&self) -> Option<&CatchupRecord> {
         self.catchup.as_ref()
@@ -238,13 +377,13 @@ pub(super) fn read_shape_in(key: &Key, tx: &Handle, expected: &[u8]) -> Result<U
     if raw != expected {
         return Err(Error::StateCorrupt);
     }
-    let record: Record = json::decode(&raw, false)?;
-    if record.version != 1 || json::encode(&record, false)? != raw {
-        return Err(Error::StateCorrupt);
-    }
+    let record = parse_record(&raw)?;
     let mut values = vec!["Enrollment", "Host", "Original", "Policy", "Record"];
     if record.catchup.is_some() {
         values.push("Catchup");
+    }
+    if record.metadata.is_some() {
+        values.extend(metadata::VALUE_NAMES);
     }
     exact(key, true, &values)?;
     let catchup = record
@@ -312,17 +451,54 @@ pub(super) fn read_shape_in(key: &Key, tx: &Handle, expected: &[u8]) -> Result<U
         policy: policy.denied_key_ids,
         policy_raw,
     };
+    let metadata = record
+        .metadata
+        .as_ref()
+        .map(|descriptor| descriptor.read_in(key, &event, &host, &original))
+        .transpose()?;
     Ok(UnverifiedMember {
         denials,
         state,
         original,
         catchup,
+        event,
+        host,
+        metadata,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn versioned_metadata_witness_cannot_backfill_an_absent_v1_snapshot() {
+        // Independently shaped old record: no new field is serialized into V1.
+        let blob = serde_json::json!({"size":1,"sha256":json::sha256(b"x")});
+        let mut old = serde_json::json!({"version":1,"enrollment":blob,"host":blob,
+            "original":blob,"state":blob,"policy":blob});
+        let raw = json::encode(&old, false).unwrap();
+        let parsed = parse_record(&raw).unwrap();
+        assert!(parsed.metadata.is_none());
+        assert_eq!(json::encode(&parsed, false).unwrap(), raw);
+        old["version"] = serde_json::json!(2);
+        assert!(parse_record(&json::encode(&old, false).unwrap()).is_err());
+        old["metadata"] = serde_json::json!({"bootstrap":blob,"genesis":blob,"head":blob,
+            "waterlogHead":blob,"rolePolicy":blob});
+        assert!(parse_record(&json::encode(&old, false).unwrap()).is_ok());
+        old["version"] = serde_json::json!(1);
+        assert!(parse_record(&json::encode(&old, false).unwrap()).is_err());
+        old["version"] = serde_json::json!(3);
+        assert!(parse_record(&json::encode(&old, false).unwrap()).is_err());
+        old["version"] = serde_json::json!(2);
+        old["metadata"]
+            .as_object_mut()
+            .unwrap()
+            .remove("waterlogHead");
+        assert!(parse_record(&json::encode(&old, false).unwrap()).is_err());
+        old["metadata"] = serde_json::Value::Null;
+        assert!(parse_record(&json::encode(&old, false).unwrap()).is_err());
+    }
 
     #[test]
     fn replay_visits_each_independent_list_without_a_union_limit() {

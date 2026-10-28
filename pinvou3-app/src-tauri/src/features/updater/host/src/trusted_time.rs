@@ -279,8 +279,22 @@ impl Evidence {
         binding: &Binding,
         original: &[u8],
         count: usize,
-        mut read: impl FnMut(usize) -> Result<std::borrow::Cow<'a, [u8]>>,
+        read: impl FnMut(usize) -> Result<std::borrow::Cow<'a, [u8]>>,
     ) -> Result<()> {
+        self.verify_source_checked(binding, original, count, read)
+            .map(|_| ())
+    }
+
+    /// The same complete historical verification, retaining its final Root
+    /// signature proof for a separately authenticated active-set reader. This
+    /// remains supplied historical DATA, never a native source or clock grant.
+    pub(crate) fn verify_source_checked<'a>(
+        &self,
+        binding: &Binding,
+        original: &[u8],
+        count: usize,
+        mut read: impl FnMut(usize) -> Result<std::borrow::Cow<'a, [u8]>>,
+    ) -> Result<pinvou_upgrade_verifier::SignatureCheckedTimeResponse> {
         self.incarnation.validate()?;
         let policy = Policy::parse(self.policy.as_bytes(), binding)?;
         check_denied(&self.denied_key_ids)?;
@@ -390,7 +404,7 @@ impl Evidence {
         if checked.earliest_millis() != self.earliest || checked.latest_millis() != self.latest {
             return Err(Error::StateCorrupt);
         }
-        Ok(())
+        Ok(checked)
     }
 }
 
@@ -1312,8 +1326,8 @@ mod tests {
         let (state, _, original) = anchored();
         let evidence = state.evidence.as_ref().unwrap();
         let mut calls = Vec::new();
-        evidence
-            .verify_source(&state.binding, &original, state.roots.len(), |index| {
+        let checked = evidence
+            .verify_source_checked(&state.binding, &original, state.roots.len(), |index| {
                 calls.push(index);
                 Ok(std::borrow::Cow::Owned(
                     state.roots[index].as_bytes().to_vec(),
@@ -1321,6 +1335,13 @@ mod tests {
             })
             .unwrap();
         assert_eq!(calls, vec![0, 0]);
+        assert_eq!(
+            checked.root_sha256(),
+            json::sha256(state.current_root(&original))
+        );
+        assert_eq!(checked.checked_root_steps(), state.roots.len());
+        assert_eq!(checked.earliest_millis(), evidence.earliest);
+        assert_eq!(checked.latest_millis(), evidence.latest);
         let mut calls = 0;
         assert_eq!(
             evidence.verify_source(&state.binding, &original, state.roots.len(), |index| {

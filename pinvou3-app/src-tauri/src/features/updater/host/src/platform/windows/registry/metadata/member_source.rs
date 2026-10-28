@@ -26,6 +26,60 @@ pub(in crate::platform::windows::registry) struct MemberMetadataView<'member, 'p
     batches: u64,
 }
 
+/// Bounded snapshot DATA, not a native-source or active-set capability. Only a
+/// Root owner's authenticated enclosing member record can give these historical
+/// bytes provenance; complete native prefix replay is still mandatory.
+pub(in crate::platform::windows::registry) struct CapturedMetadataPins {
+    pub(in crate::platform::windows::registry) bootstrap: Vec<u8>,
+    pub(in crate::platform::windows::registry) genesis: Vec<u8>,
+    pub(in crate::platform::windows::registry) head: Vec<u8>,
+    pub(in crate::platform::windows::registry) waterlog_head: Vec<u8>,
+    pub(in crate::platform::windows::registry) role_policy: Vec<u8>,
+}
+
+/// Bootstrap/policy and canonical shape only. A historical reader must verify
+/// both full native journal prefixes, samples, graphs and waters separately.
+pub(in crate::platform::windows::registry) fn validate_captured_pins(
+    event: &crate::product_catalog::Event,
+    host: &HostRegistration,
+    original: &[u8],
+    pins: &CapturedMetadataPins,
+) -> Result<()> {
+    let binding = BootstrapBinding::new(
+        &event.scope,
+        &event.product,
+        &event.component,
+        &event.target_key,
+        &event.kind,
+        &event.profile_id,
+        &event.seed_sha256,
+    )
+    .map_err(|_| Error::StateCorrupt)?;
+    let anchor = BootstrapAnchor::new(
+        &binding,
+        original,
+        event.original_root_size,
+        &event.original_root_sha256,
+    )
+    .map_err(|_| Error::StateCorrupt)?;
+    anchor
+        .check_existing(&pins.bootstrap, original)
+        .map_err(|_| Error::StateCorrupt)?;
+    if pins.genesis != genesis(anchor.record_bytes())? {
+        return Err(Error::StateCorrupt);
+    }
+    policy::Policy::parse(&pins.role_policy, &Binding::from_host(host))?;
+    for raw in [&pins.head, &pins.waterlog_head] {
+        let value: serde_json::Value = json::decode(raw, false)?;
+        if value.as_object().is_none_or(|object| object.is_empty())
+            || json::encode(&value, false)? != *raw
+        {
+            return Err(Error::StateCorrupt);
+        }
+    }
+    Ok(())
+}
+
 pub(in crate::platform::windows::registry) fn visit_metadata_members<'prefix, 'tx>(
     seed: &'tx Seed,
     requester: &HostRegistration,
@@ -142,6 +196,30 @@ impl<'member, 'prefix, 'tx> MemberMetadataView<'member, 'prefix, 'tx> {
     }
     pub(in crate::platform::windows::registry) fn batches(&self) -> u64 {
         self.batches
+    }
+
+    /// Capture only bounded references from this already authenticated current
+    /// source. The Root snapshot owner must bind all five blobs to its member
+    /// descriptor in the same TxR; these bytes alone grant no historical trust.
+    pub(in crate::platform::windows::registry) fn snapshot_pins(
+        &self,
+    ) -> Result<CapturedMetadataPins> {
+        self.recheck()?;
+        let pins = CapturedMetadataPins {
+            bootstrap: read(self.member.private(), METADATA_BOOTSTRAP)?,
+            genesis: self.initial.clone(),
+            head: self.head.clone(),
+            waterlog_head: self.position.head_bytes().to_vec(),
+            role_policy: self.role_raw.clone(),
+        };
+        validate_captured_pins(
+            self.member.event(),
+            self.member.host(),
+            self.member.original_root(),
+            &pins,
+        )?;
+        self.recheck()?;
+        Ok(pins)
     }
 
     fn check_pins(&self) -> Result<()> {
@@ -265,7 +343,7 @@ impl<'member, 'prefix, 'tx> MemberMetadataView<'member, 'prefix, 'tx> {
     }
 }
 
-fn active_context(
+pub(super) fn active_context(
     raw: &[u8],
     product: &str,
     component: &str,
@@ -298,7 +376,7 @@ fn active_context(
     Ok((checked, expected))
 }
 
-fn reject_current_denials(
+pub(super) fn reject_current_denials(
     checked: &SchemaCheckedEnvelope,
     state_global: &[String],
     policy_global: &[String],
