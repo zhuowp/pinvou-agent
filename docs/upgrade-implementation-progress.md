@@ -1,5 +1,17 @@
 # Upgrade implementation progress
 
+T27 protocol verifier component: the streamed time verifier checks each supplied
+Root in order, including both transition thresholds and the maximum issued time
+in that supplied chain. The caller must authenticate the initial Root, provide
+the complete stable originals, and preserve any earlier authenticated time bound.
+The slice API retains its 4096-item limit; the streamed API accepts more independent
+objects. The current Windows host still limits retained Roots to 4096 and has not
+integrated long streamed histories, so this component does not complete T27 or
+establish Windows long-history support. It grants no protected storage, trusted
+clock, or installation authority. Verifier tests cover 4097 signed Roots,
+the collection boundary and failure cases; Windows verifier tests, clippy and
+the architecture guard passed. Independent review remains pending. No E2E was run.
+
 T27 Windows time acquisition now performs a protected product-member census
 before any time or Root request, after invalidating an existing time observation.
 The publication transaction retains its own recheck. This is a temporary

@@ -874,6 +874,19 @@ class CiGatePolicyTests(unittest.TestCase):
             else:
                 self.assertNotIn("if:", step)
 
+    def test_streamed_root_verifier_fixtures_route_and_execute(self):
+        root = "pinvou3-app/src-tauri/src/features/updater/protocol/verify"
+        block = self.pr_workflow.split("            rust_code:", 1)[1].split("            rust_dependencies:", 1)[0]
+        patterns = _extract_quoted_paths(block)
+        for path in ("tests/large-root-history.json", "tests/long_root_chain.rs", "tests/large_history.rs", "tests/support/long_root_fixture.rs"):
+            self.assertTrue(_matches_paths_filter(root + "/" + path, patterns), path)
+        job = self.pr_workflow.split("\n  rust-lint:", 1)[1].split("\n  rust-test:", 1)[0]
+        step = job.split("- name: Check upgrade public metadata verification", 1)[1].split("\n      - name:", 1)[0]
+        self.assertIn("working-directory: " + root, step)
+        self.assertIn("cargo test --locked --test long_root_chain", step)
+        self.assertIn("cargo test --locked --test large_history", step)
+        self.assertNotIn("continue-on-error:", step)
+
     def test_read_only_cache_byte_controls_run_on_native_windows(self):
         job = self.pr_workflow.split("\n  windows-rust-test:", 1)[1].split("\n  macos-rust-check:", 1)[0]
         step = job.split("- name: Check native Windows upgrade byte verification", 1)[1].split("\n      - name:", 1)[0]

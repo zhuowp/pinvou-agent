@@ -131,6 +131,58 @@ struct RootCandidate {
     expires: u64,
 }
 
+/// Authenticate one continuous successor before using it as a network anchor.
+/// The caller must first authenticate the exact predecessor and its history.
+/// This checks the successor's original lifetime, but not its validity at a
+/// trusted current time; it grants no persistence or installation authority.
+pub fn verify_time_root_successor(
+    previous: &[u8],
+    successor: &[u8],
+    product: &str,
+    denied_key_ids: &[String],
+) -> Result<(), TimeVerificationError> {
+    if denied_key_ids.len() > 4096 {
+        return Err(TimeVerificationError::InvalidObservation);
+    }
+    let mut denied = BTreeSet::new();
+    for id in denied_key_ids {
+        if !hash_shape(id) || !denied.insert(id.as_str()) {
+            return Err(TimeVerificationError::InvalidObservation);
+        }
+    }
+    let (_, current) = root_candidate(previous, product)?;
+    let (envelope, next) = root_candidate(successor, product)?;
+    if current.root.version() >= MAXIMUM || next.root.version() != current.root.version() + 1 {
+        return Err(VerificationError::RootContinuityInvalid.into());
+    }
+    if next.expires <= next.issued || next.expires.saturating_sub(next.issued) > ROOT_LIFETIME {
+        return Err(TimeVerificationError::RootWindow);
+    }
+    reject_denied(&envelope, &denied)?;
+    signatures::verify_root_transition_signatures(&envelope, &current.root, &next.root)?;
+    Ok(())
+}
+
+/// Check only the denied signature IDs of a canonical Root. The caller must
+/// independently authenticate the Root and preserve its exact bytes.
+pub fn check_time_root_denials(
+    root: &[u8],
+    product: &str,
+    denied_key_ids: &[String],
+) -> Result<(), TimeVerificationError> {
+    if denied_key_ids.len() > 4096 {
+        return Err(TimeVerificationError::InvalidObservation);
+    }
+    let mut denied = BTreeSet::new();
+    for id in denied_key_ids {
+        if !hash_shape(id) || !denied.insert(id.as_str()) {
+            return Err(TimeVerificationError::InvalidObservation);
+        }
+    }
+    let (envelope, _) = root_candidate(root, product)?;
+    reject_denied(&envelope, &denied)
+}
+
 /// Authenticate the dedicated body and continuous Root lineage without treating
 /// response serverTime as an already trusted now. Window checks happen only in
 /// this private candidate path, against the complete derived interval below.
@@ -138,6 +190,11 @@ pub fn verify_time_response(
     bytes: &[u8],
     inputs: TimeVerificationInputs<'_>,
 ) -> Result<SignatureCheckedTimeResponse, TimeVerificationError> {
+    // This API accepts one in-memory collection. Long independent histories
+    // use the source API rather than removing the single-collection bound.
+    if inputs.successors.len() > 4096 {
+        return Err(TimeVerificationError::InvalidObservation);
+    }
     verify_time_response_source(
         bytes,
         inputs.trusted_root_bytes,
@@ -153,7 +210,7 @@ pub fn verify_time_response(
 /// source is caller-owned DATA: it cannot establish protected custody, latest
 /// Root, a trusted clock, or completeness. `count` is the exact batch length;
 /// source errors abort verification and are never interpreted as end-of-chain.
-/// Per-object codec limits and the existing 4096-step batch limit still apply.
+/// Per-object codec limits apply; independently supplied Roots are streamed.
 pub fn verify_time_response_source<'a>(
     bytes: &[u8],
     trusted_root_bytes: &[u8],
@@ -164,7 +221,7 @@ pub fn verify_time_response_source<'a>(
     denied_key_ids: &[String],
 ) -> Result<SignatureCheckedTimeResponse, TimeVerificationError> {
     let round_trip = observed_round_trip(observation)?;
-    if count > 4096 || denied_key_ids.len() > 4096 {
+    if denied_key_ids.len() > 4096 {
         return Err(TimeVerificationError::InvalidObservation);
     }
     let mut denied = BTreeSet::new();

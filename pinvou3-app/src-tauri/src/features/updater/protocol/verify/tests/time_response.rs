@@ -2,8 +2,8 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use pinvou_upgrade_codec::{Document, InputKind};
 use pinvou_upgrade_verifier::{
     SuppliedTimeObservation, TimeVerificationError, TimeVerificationInputs, VerificationError,
-    VerificationInputs, verify_time_response, verify_time_response_source,
-    verify_with_supplied_root,
+    VerificationInputs, check_time_root_denials, verify_time_response, verify_time_response_source,
+    verify_time_root_successor, verify_with_supplied_root,
 };
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use serde_json::{Value, json};
@@ -122,6 +122,105 @@ fn observation() -> SuppliedTimeObservation {
         max_uncertainty_millis: 5,
         trusted_time_floor_millis: 99_995,
     }
+}
+
+#[test]
+fn successor_helper_requires_both_thresholds_continuity_and_current_denials() {
+    let f = fixture();
+    assert!(verify_time_root_successor(&f.initial, &f.successor, "pinvou", &[]).is_ok());
+    for keys in [
+        vec![&f.old_keys[0], &f.old_keys[1]],
+        vec![&f.new_keys[0], &f.new_keys[1]],
+    ] {
+        let candidate = signed(&f.final_claims, &keys);
+        assert!(matches!(
+            verify_time_root_successor(&f.initial, &candidate, "pinvou", &[]),
+            Err(TimeVerificationError::Verification(
+                VerificationError::ThresholdUnmet
+            ))
+        ));
+    }
+    let mut skipped = f.final_claims.clone();
+    skipped["version"] = json!(3);
+    let candidate = signed(
+        &skipped,
+        &[
+            &f.old_keys[0],
+            &f.old_keys[1],
+            &f.new_keys[0],
+            &f.new_keys[1],
+        ],
+    );
+    assert!(matches!(
+        verify_time_root_successor(&f.initial, &candidate, "pinvou", &[]),
+        Err(TimeVerificationError::Verification(
+            VerificationError::RootContinuityInvalid
+        ))
+    ));
+    let denied = [f.old_keys[0].descriptor["keyId"]
+        .as_str()
+        .unwrap()
+        .to_owned()];
+    assert!(matches!(
+        verify_time_root_successor(&f.initial, &f.successor, "pinvou", &denied),
+        Err(TimeVerificationError::Verification(
+            VerificationError::SigningKeyDenied
+        ))
+    ));
+}
+
+#[test]
+fn root_deny_helper_rejects_denied_ids_but_does_not_authenticate_signatures() {
+    let f = fixture();
+    assert!(check_time_root_denials(&f.successor, "pinvou", &[]).is_ok());
+    let id = f.old_keys[0].descriptor["keyId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(matches!(
+        check_time_root_denials(&f.successor, "pinvou", std::slice::from_ref(&id)),
+        Err(TimeVerificationError::Verification(
+            VerificationError::SigningKeyDenied
+        ))
+    ));
+    assert!(matches!(
+        check_time_root_denials(&f.successor, "pinvou", &[id.clone(), id]),
+        Err(TimeVerificationError::InvalidObservation)
+    ));
+    assert!(matches!(
+        check_time_root_denials(&f.successor, "pinvou", &["bad".to_owned()]),
+        Err(TimeVerificationError::InvalidObservation)
+    ));
+    let mut damaged: Value = serde_json::from_slice(&f.successor).unwrap();
+    damaged["signatures"][0]["signature"] = json!(URL_SAFE_NO_PAD.encode([0; 64]));
+    let damaged = document(&damaged).canonical_bytes().unwrap();
+    assert!(check_time_root_denials(&damaged, "pinvou", &[]).is_ok());
+    assert!(verify_time_root_successor(&f.initial, &damaged, "pinvou", &[]).is_err());
+}
+
+#[test]
+fn slice_keeps_single_collection_limit_before_processing() {
+    let f = fixture();
+    let request = document(&f.request).time_request_shape().unwrap();
+    let roots = vec![f.successor.as_slice(); 4097];
+    let verify = |count| {
+        verify_time_response(
+            &f.response,
+            TimeVerificationInputs::new(&f.initial, &roots[..count], &request, observation(), &[]),
+        )
+    };
+    // 4096 is processed and rejected for the deliberately repeated version.
+    assert!(matches!(
+        verify(4096),
+        Err(TimeVerificationError::Verification(
+            VerificationError::RootContinuityInvalid
+        ))
+    ));
+    // 4097 is rejected by the collection bound before reading any successor.
+    assert!(matches!(
+        verify(4097),
+        Err(TimeVerificationError::InvalidObservation)
+    ));
 }
 fn check(
     f: &Fixture,
@@ -409,8 +508,6 @@ fn safe_interval_limits_and_every_original_root_window_are_rechecked_without_a_s
         )
         .is_ok()
     );
-    let oversized = vec![f.successor.as_slice(); 4097];
-    assert!(check(&f, &f.initial, &oversized, &f.response, observation(), &[]).is_err());
 }
 
 #[test]
@@ -485,7 +582,7 @@ fn generated_public_node_vectors_match_the_dedicated_interval_and_rotated_root()
 }
 
 #[test]
-fn source_failure_and_batch_limit_are_not_end_of_chain() {
+fn source_failure_and_large_count_are_not_end_of_chain() {
     let f = fixture();
     let request = document(&f.request).time_request_shape().unwrap();
     let failure = TimeVerificationError::Verification(VerificationError::RootContinuityInvalid);
@@ -509,19 +606,20 @@ fn source_failure_and_batch_limit_are_not_end_of_chain() {
         &f.response,
         &f.initial,
         4097,
-        |_| {
+        |index| {
             called += 1;
-            Ok(std::borrow::Cow::Owned(f.successor.clone()))
+            if index == 0 {
+                Ok(std::borrow::Cow::Borrowed(f.successor.as_slice()))
+            } else {
+                Err(failure)
+            }
         },
         &request,
         observation(),
         &[],
     );
-    assert!(matches!(
-        result,
-        Err(TimeVerificationError::InvalidObservation)
-    ));
-    assert_eq!(called, 0);
+    assert!(matches!(result, Err(error) if error == failure));
+    assert_eq!(called, 2);
 }
 
 #[test]

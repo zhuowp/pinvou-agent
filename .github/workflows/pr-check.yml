@@ -250,6 +250,7 @@ jobs:
               - 'pinvou3-app/src-tauri/src/features/updater/native-evidence/**'
               - 'pinvou3-app/src-tauri/src/features/updater/platform/custody/**'
               - 'pinvou3-app/src-tauri/src/features/updater/protocol/codec/**'
+              - 'pinvou3-app/src-tauri/src/features/updater/protocol/verify/**'
               - 'pinvou3-app/src-tauri/src/features/updater/protocol/acceptance/**'
               - 'pinvou3-app/src-tauri/src/features/updater/protocol/http/**'
               - 'specs/upgrade/v1/**'
@@ -1225,6 +1226,8 @@ jobs:
           cargo clippy --locked --all-targets -- -D warnings
           cargo test --locked --test public_chain
           cargo test --locked --test time_response
+          cargo test --locked --test long_root_chain
+          cargo test --locked --test large_history
 
       - name: Check isolated durable metadata acceptance QA
         working-directory: pinvou3-app/src-tauri/src/features/updater/protocol/acceptance
