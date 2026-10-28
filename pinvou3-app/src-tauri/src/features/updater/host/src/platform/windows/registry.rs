@@ -1,6 +1,7 @@
 //! Protected native64 registry transaction owner; no ordinary-file fallback.
 //! Files/SCM are outside this transaction and are recovered from original intent.
 pub(super) mod budgets;
+mod check_scope;
 pub(super) mod keeper;
 mod metadata;
 #[cfg(feature = "metadata-component-tests")]
@@ -387,6 +388,7 @@ fn owner_bootstrap_in(
     tx: Option<&Handle>,
     verify_product: bool,
 ) -> Result<()> {
+    check_scope::read_in(key, record, tx)?;
     if !crate::bootstrap::initialized(&record.known_owner_namespaces) {
         for name in [
             METADATA_BOOTSTRAP,
@@ -577,6 +579,7 @@ impl Store {
         writers::verify_fresh_in(&key, &actual)?;
         keeper::verify_fresh_in(&key, &actual)?;
         retention::verify_fresh_in(&key, &actual)?;
+        check_scope::read_in(&key, &actual, None)?;
         time::verify_fresh_policy_in(&key, &actual)?;
         let time = self.time_load(seed, &actual)?;
         if time.state.revision != 1 || time.state.floor.is_some() || !time.state.cleanup_pending {
@@ -769,7 +772,7 @@ impl Store {
         // Both owners are initialized only by a genuinely new original intent.
         // Existing/unknown outcomes are read back, never filled or reset.
         let initial_owners = if expected.is_none() {
-            if !crate::bootstrap::initialized(&next.known_owner_namespaces) {
+            if !crate::bootstrap::has_check_scope(&next.known_owner_namespaces) {
                 return Err(Error::StateCorrupt);
             }
             Some(OwnerBootstrap::new(seed, &next.installation_scope_id)?)
@@ -885,6 +888,7 @@ impl Store {
         write(&private, "Head", &bytes)?;
         write(&history_revision, "Record", &bytes)?;
         write(&public, "Head", &json::encode(&next.public(), false)?)?;
+        let mut initial_check_scope = None;
         if let Some(owners) = initial_owners {
             // Same native transaction as the first scope, intent and manifest.
             // The owner modules define and validate their bounded genesis bytes.
@@ -899,6 +903,7 @@ impl Store {
                 PREPARATION_BOOTSTRAP,
                 owners.ownership.record_bytes(),
             )?;
+            initial_check_scope = Some(check_scope::initialize_in(&private, &transaction, next)?);
             // Full product directory/history authentication follows once the
             // entire initial namespace and inventory have been staged.
             owner_bootstrap_in(&private, seed, next, Some(&transaction), false)?;
@@ -926,6 +931,11 @@ impl Store {
             .ok_or(Error::StateCorrupt)?;
         if staged.digest()? != next.digest()? {
             return Err(Error::ScopeConflict);
+        }
+        if expected.is_none()
+            && check_scope::read_in(&private, &staged, Some(&transaction))? != initial_check_scope
+        {
+            return Err(Error::StateCorrupt);
         }
         // Every native transaction key is closed BEFORE the definitive commit.
         drop(public);
@@ -986,6 +996,9 @@ impl Store {
                 return Err(Error::StateCommitUnknown);
             }
             if expected.is_none() {
+                if check_scope::read_in(&key, &actual, None)? != initial_check_scope {
+                    return Err(Error::StateCommitUnknown);
+                }
                 metadata::verify_fresh_in(&key, seed, &actual)?;
                 product_catalog::verify_committed(seed, &actual)?;
                 // Fresh time genesis is part of the original definitive commit,

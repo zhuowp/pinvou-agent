@@ -28,6 +28,7 @@ pub(crate) struct InstalledImages {
     service: RetainedProcess,
     diagnostic: InstalledImageDiagnostic,
     verified: bool,
+    original_scope: Option<crate::check_scope::Snapshot>,
 }
 fn stamp(record: &HostRegistration, service: &RetainedProcess) -> Result<ObservationStamp> {
     if record.phase != Phase::Ready {
@@ -67,6 +68,15 @@ impl InstalledImages {
         }
         Ok(&self.diagnostic)
     }
+    pub(crate) fn check_scope_json(&self) -> Result<Vec<u8>> {
+        if !self.verified {
+            return Err(Error::ImageRefused);
+        }
+        self.original_scope
+            .as_ref()
+            .map(crate::check_scope::Snapshot::scope_json)
+            .ok_or(Error::SourceUnavailable)
+    }
     pub(crate) fn source_semantics_json(&self) -> Result<Vec<u8>> {
         if !self.verified {
             return Err(Error::ImageRefused);
@@ -79,7 +89,10 @@ impl InstalledImages {
         poll(cancelled)?;
         let host = super::source_host::capture()?;
         let store = Store::new(&self.seed);
-        let before = store.read(&self.seed)?.ok_or(Error::SetupIncomplete)?;
+        let (before, scope_before) = store.read_with_check_scope(&self.seed)?;
+        if scope_before != self.original_scope {
+            return Err(Error::ScopeConflict);
+        }
         let live = running(&self.seed, &self.layout, &before)?;
         if self.service.exited()? {
             return Err(Error::ServiceIdentityRefused);
@@ -155,7 +168,10 @@ impl InstalledImages {
             cancelled,
         )?;
         self.images.helper_root.recheck()?;
-        let after = store.read(&self.seed)?.ok_or(Error::SetupIncomplete)?;
+        let (after, scope_after) = store.read_with_check_scope(&self.seed)?;
+        if scope_after != self.original_scope {
+            return Err(Error::ScopeConflict);
+        }
         let live_after = running(&self.seed, &self.layout, &after)?;
         require_unchanged(&self.original, &stamp(&after, &live_after)?)?;
         if self.service.exited()? || live.exited()? {
@@ -189,9 +205,7 @@ pub(crate) fn inspect_images(cancelled: &mut dyn FnMut() -> bool) -> Result<Inst
     }
     let seed = Seed::embedded()?;
     let layout = Layout::discover(&seed)?;
-    let record = Store::new(&seed)
-        .read(&seed)?
-        .ok_or(Error::SetupIncomplete)?;
+    let (record, original_scope) = Store::new(&seed).read_with_check_scope(&seed)?;
     if record.phase != Phase::Ready {
         return Err(Error::SetupIncomplete);
     }
@@ -241,6 +255,7 @@ pub(crate) fn inspect_images(cancelled: &mut dyn FnMut() -> bool) -> Result<Inst
         service,
         diagnostic,
         verified: false,
+        original_scope,
     };
     result.recheck(cancelled)?;
     Ok(result)

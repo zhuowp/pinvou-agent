@@ -4,6 +4,7 @@ mod app_writer;
 mod writer_status;
 pub use writer_status::{WriterJournalCounts, WriterJournalStatus, WriterStatusObservation};
 mod bootstrap;
+mod check_scope;
 pub use app_writer::{
     AppWriterAdmission, AppWriterStartup, CliEntry, admit_current_app_writer,
     admit_current_cli_writer, enter_current_cli, finish_current_cli,

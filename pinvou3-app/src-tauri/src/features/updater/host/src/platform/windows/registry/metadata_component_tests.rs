@@ -164,6 +164,8 @@ pub(crate) fn run_isolated() {
     Store::new(&seed)
         .verify_initial_metadata(&seed, &reopened)
         .expect("recheck original initial intent");
+    check_scope_uses_persisted_native_owner(&store, &seed, &reopened);
+    let first_scope = store.read_with_check_scope(&seed).unwrap().1.unwrap();
     historical_genesis_uses_transacted_registry(&store, &seed, &reopened);
     metadata_finalization_pins_use_transacted_registry(&store, &seed, &reopened);
     member_metadata_genesis_uses_actual_catalog(&store, &seed, &reopened);
@@ -223,9 +225,42 @@ pub(crate) fn run_isolated() {
     normal
         .verify_initial_metadata(&seed, &committed)
         .expect("normal initial state remains valid");
+    let second_scope = normal.read_with_check_scope(&seed).unwrap().1.unwrap();
+    let first: serde_json::Value = json::decode(&first_scope.scope_json(), false).unwrap();
+    let second: serde_json::Value = json::decode(&second_scope.scope_json(), false).unwrap();
+    assert_ne!(
+        first["installId"], second["installId"],
+        "two actual fresh producers must not reuse identity"
+    );
     product_lock_contention(&seed);
     missing_top_level_catalog_refuses_initialized_profile(&normal, &seed);
     _normal_root.finish();
+}
+
+fn check_scope_uses_persisted_native_owner(store: &Store, seed: &Seed, host: &HostRegistration) {
+    let (actual, scope) = store.read_with_check_scope(seed).unwrap();
+    assert_eq!(actual.digest().unwrap(), host.digest().unwrap());
+    let scope = scope.expect("real first-install scope owner");
+    let json = scope.scope_json();
+    let fields: serde_json::Value = crate::json::decode(&json, false).unwrap();
+    assert_eq!(fields.as_object().unwrap().len(), 7);
+    assert!(crate::json::digest(fields["installId"].as_str().unwrap()));
+    assert_ne!(fields["installId"], host.installation_scope_id);
+    assert_ne!(fields["installId"], host.original_install_operation_id);
+    assert_eq!(fields["channel"], "stable");
+    assert_eq!(fields["channelRevision"], 1);
+    // Exactly one bounded marker, from the actual reopened protected owner. CI
+    // feeds these precise public test bytes to the existing frozen API schema.
+    println!(
+        "PINVOU_NATIVE_CHECK_SCOPE_JSON={}",
+        String::from_utf8(json).unwrap()
+    );
+    store.verify_initial_metadata(seed, host).unwrap();
+    assert_eq!(
+        store.read_with_check_scope(seed).unwrap().1.as_ref(),
+        Some(&scope)
+    );
+    check_scope::component_probes(store, host, &scope);
 }
 
 #[allow(unsafe_code)]
@@ -1270,6 +1305,12 @@ fn legacy_ready_is_readable(store: &Store, seed: &Seed, initial: &HostRegistrati
         unsafe { RegDeleteTreeW(private.0, wide("metadata-state-v1").as_ptr()) },
         0
     );
+    // The old serialized namespace predates this owner. Remove it from this
+    // test-owned fixture instead of treating a new owner as legacy migration.
+    assert_eq!(
+        unsafe { RegDeleteTreeW(private.0, wide("check-scope-v1").as_ptr()) },
+        0
+    );
     let first = open(private.0, "history\\0000000000000001", true, None)
         .unwrap()
         .unwrap();
@@ -1304,6 +1345,7 @@ fn legacy_ready_is_readable(store: &Store, seed: &Seed, initial: &HostRegistrati
         .unwrap()
         .expect("legacy Ready remains readable");
     assert_eq!(actual.digest().unwrap(), ready.digest().unwrap());
+    assert_eq!(store.read_with_check_scope(seed).unwrap().1, None);
     assert!(matches!(
         store.original_root(seed, &actual),
         Err(Error::InitialTrustUnavailable)
