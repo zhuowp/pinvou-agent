@@ -165,6 +165,7 @@ pub(crate) fn run_isolated() {
         .verify_initial_metadata(&seed, &reopened)
         .expect("recheck original initial intent");
     historical_genesis_uses_transacted_registry(&store, &seed, &reopened);
+    publication_staging_uses_transacted_registry(&store, &seed);
     waterlog_structure_uses_transacted_registry(&store, &seed, &reopened);
     if seed.original_root.sha256
         == "9caab397724ac6fed0a308b9be94d375ad01ce590e50ea5a4286836842977c56"
@@ -220,6 +221,26 @@ pub(crate) fn run_isolated() {
     product_lock_contention(&seed);
     missing_top_level_catalog_refuses_initialized_profile(&normal, &seed);
     _normal_root.finish();
+}
+
+#[allow(unsafe_code)]
+fn publication_staging_uses_transacted_registry(store: &Store, seed: &Seed) {
+    let _profile = BootstrapGuard::acquire(seed, false).unwrap();
+    let _product = product_catalog::ProductGuard::acquire(seed).unwrap();
+    // A failed partial construction must roll back, then the next fresh
+    // transaction can stage and delete the same owned namespace successfully.
+    for partial in [true, false, false] {
+        {
+            let tx = Handle::owned(unsafe {
+                CreateTransaction(ptr::null_mut(), ptr::null_mut(), 0, 0, 0, 0, ptr::null())
+            })
+            .unwrap();
+            let private = store.key(true, Some(&tx)).unwrap().unwrap();
+            metadata::publication::component_test_staging_in(&private, &tx, partial).unwrap();
+        }
+        let private = store.key(false, None).unwrap().unwrap();
+        metadata::publication::component_test_no_staging(&private).unwrap();
+    }
 }
 
 #[allow(unsafe_code)]

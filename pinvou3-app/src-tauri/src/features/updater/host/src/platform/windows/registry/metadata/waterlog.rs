@@ -1,6 +1,7 @@
-//! First-install protected water history anchor. No metadata acceptance writer.
+//! Protected original-byte water history and atomic historical observations.
 use super::*;
 use serde::{Deserialize, Serialize};
+pub(super) mod publication;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -498,7 +499,7 @@ fn count_result(status: u32, values: u32, subkeys: u32) -> Result<()> {
 }
 
 #[allow(unsafe_code)]
-fn exact_counts(key: &Key, expected_values: u64, expected_subkeys: u64) -> Result<()> {
+pub(super) fn exact_counts(key: &Key, expected_values: u64, expected_subkeys: u64) -> Result<()> {
     let mut values = 0;
     let mut subkeys = 0;
     let status = unsafe {
