@@ -1,5 +1,11 @@
 //! First-install Root watermark only. There is no metadata acceptance writer.
+mod policy;
+pub(super) mod replay;
+mod replay_index;
+pub(super) mod time_history;
+mod waterlog;
 use super::*;
+use crate::trusted_time::Binding;
 use serde::Serialize;
 
 const NAMESPACE: &str = "metadata-state-v1";
@@ -60,7 +66,7 @@ pub(super) fn require_empty_for_root_transition_in(
         return Err(Error::SetupIncomplete);
     }
     let expected = OwnerBootstrap::new(seed, &host.installation_scope_id)?;
-    require_genesis_in(private, expected.metadata.record_bytes(), tx)
+    require_genesis_in(private, expected.metadata.record_bytes(), host, tx)
 }
 
 /// The event and host must come from the protected product member visitor.
@@ -102,10 +108,15 @@ pub(super) fn require_member_empty_for_root_transition_in(
     anchor
         .check_existing(&read(&private, METADATA_BOOTSTRAP)?, &original)
         .map_err(|_| Error::StateCorrupt)?;
-    require_genesis_in(&private, anchor.record_bytes(), tx)
+    require_genesis_in(&private, anchor.record_bytes(), host, tx)
 }
 
-fn require_genesis_in(private: &Key, anchor: &[u8], tx: &Handle) -> Result<()> {
+fn require_genesis_in(
+    private: &Key,
+    anchor: &[u8],
+    host: &HostRegistration,
+    tx: &Handle,
+) -> Result<()> {
     let initial = genesis(anchor)?;
     let key = open(private.0, NAMESPACE, false, Some(tx))?.ok_or(Error::SetupIncomplete)?;
     let first =
@@ -118,13 +129,31 @@ fn require_genesis_in(private: &Key, anchor: &[u8], tx: &Handle) -> Result<()> {
     if read(&key, "Head")? != initial {
         return Err(Error::ScopeConflict);
     }
-    exact_names(&names(&key, true, 2)?, &["Genesis", "Head"])?;
-    exact_names(&names(&key, false, 1)?, &["history"])?;
+    policy::read_in(&key, &Binding::from_host(host))?;
+    exact_names(&names(&key, true, 3)?, &["Genesis", "Head", "Policy"])?;
+    exact_names(&names(&key, false, 2)?, &["history", "waterlog"])?;
+    waterlog::require_empty_in(&key, &initial, Some(tx))?;
     let history = open(key.0, "history", false, Some(tx))?.ok_or(Error::StateCorrupt)?;
     exact_names(&names(&history, true, 0)?, &[])?;
     exact_names(&names(&history, false, 1)?, &["0000000000000001"])?;
     exact_names(&names(&first, true, 1)?, &["Record"])?;
     exact_names(&names(&first, false, 0)?, &[])
+}
+
+#[cfg(feature = "metadata-component-tests")]
+pub(super) fn component_test_waterlog_structure_in(
+    private: &Key,
+    seed: &Seed,
+    host: &HostRegistration,
+    tx: &Handle,
+) -> Result<()> {
+    let initial = genesis(
+        OwnerBootstrap::new(seed, &host.installation_scope_id)?
+            .metadata
+            .record_bytes(),
+    )?;
+    let key = open(private.0, NAMESPACE, false, Some(tx))?.ok_or(Error::StateCorrupt)?;
+    waterlog::component_test_structure_in(&key, &initial, tx)
 }
 
 pub(super) fn check_in(
@@ -141,6 +170,8 @@ pub(super) fn check_in(
     let expected = OwnerBootstrap::new(seed, &host.installation_scope_id)?;
     let raw = genesis(expected.metadata.record_bytes())?;
     let key = open(private.0, NAMESPACE, false, tx)?.ok_or(Error::SetupIncomplete)?;
+    policy::read_in(&key, &Binding::from_host(host))?;
+    waterlog::require_empty_in(&key, &raw, tx)?;
     let first = open(key.0, "history\\0000000000000001", false, tx)?.ok_or(Error::StateCorrupt)?;
     check_bytes(
         &raw,
@@ -163,6 +194,8 @@ pub(super) fn initialize_in(
     let first = create(history.0, &revision_name(1), tx, false, true)?;
     write(&key, "Genesis", &raw)?;
     write(&key, "Head", &raw)?;
+    policy::initialize_in(&key, &Binding::from_host(host))?;
+    waterlog::initialize_in(&key, &raw, tx)?;
     write(&first, "Record", &raw)?;
     check_in(private, seed, host, Some(tx))
 }
@@ -172,7 +205,13 @@ pub(super) fn verify_fresh_in(private: &Key, seed: &Seed, host: &HostRegistratio
     let key = open(private.0, NAMESPACE, false, None)?.ok_or(Error::StateCommitUnknown)?;
     let first =
         open(key.0, "history\\0000000000000001", false, None)?.ok_or(Error::StateCommitUnknown)?;
-    if unsafe { RegFlushKey(key.0) } != 0 || unsafe { RegFlushKey(first.0) } != 0 {
+    let waterlog = open(key.0, "waterlog", false, None)?.ok_or(Error::StateCommitUnknown)?;
+    let entries = open(waterlog.0, "entries", false, None)?.ok_or(Error::StateCommitUnknown)?;
+    if unsafe { RegFlushKey(key.0) } != 0
+        || unsafe { RegFlushKey(first.0) } != 0
+        || unsafe { RegFlushKey(waterlog.0) } != 0
+        || unsafe { RegFlushKey(entries.0) } != 0
+    {
         return Err(Error::StateCommitUnknown);
     }
     check_in(private, seed, host, None)

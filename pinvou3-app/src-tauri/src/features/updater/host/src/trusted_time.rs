@@ -1,5 +1,8 @@
 //! Protected time-owner DATA and retained cryptographic evidence. No parsed
 //! record grants UTC continuity, cleanup completion or execution permission.
+#[cfg(test)]
+#[path = "../../protocol/verify/tests/support/long_root_fixture.rs"]
+mod long_root_fixture;
 mod policy_fault;
 use crate::{
     error::{Error, Result},
@@ -390,12 +393,251 @@ impl Evidence {
         Ok(())
     }
 }
+
+/// One historical advancement and its actual profile binding. The caller
+/// supplies its authenticated member deny snapshots separately during replay.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ProductRootBatch {
+    pub(crate) binding: Binding,
+    pub(crate) evidence: Evidence,
+    pub(crate) successor_count: usize,
+}
+
+/// A streaming replay cursor. The protected owner must supply the exact original,
+/// ordered batches, profile bindings and complete member snapshots from one
+/// stable authenticated storage view. `finish` must receive that view's protected
+/// head count and hash; a caller-provided unprotected head proves nothing.
+/// Bootstrap must first verify the original Root's self-signature threshold and
+/// exact pinned bytes. The storage reader must enforce per-object input limits
+/// before deserialization; checks here cannot undo an earlier allocation.
+/// Success grants no time continuity, root promotion or execution authority.
+pub(crate) struct ProductRootReplay {
+    head: String,
+    root_count: usize,
+    batch_count: u64,
+    latest_issue: u64,
+    product: String,
+}
+fn root_issue(envelope: &pinvou_upgrade_codec::CanonicalEnvelopeShape) -> Result<u64> {
+    let value = envelope.signed().value()["issuedAt"]
+        .as_f64()
+        .filter(|n| *n >= 0.0 && *n <= json::SAFE_MAX as f64 && n.fract() == 0.0)
+        .ok_or(Error::StateCorrupt)?;
+    Ok(value as u64)
+}
+pub(crate) fn root_issue_bytes(raw: &[u8]) -> Result<u64> {
+    let envelope =
+        decode_canonical_envelope(raw, InputKind::Metadata).map_err(|_| Error::StateCorrupt)?;
+    root_issue(&envelope)
+}
+pub(crate) fn check_history_time_bound(latest_issue: u64, earliest: u64) -> Result<()> {
+    if earliest < latest_issue {
+        return Err(Error::StateCorrupt);
+    }
+    Ok(())
+}
+impl ProductRootReplay {
+    pub(crate) fn new(product: &str, original: &str) -> Result<Self> {
+        if original.len() > json::RECORD_MAX || !json::identifier(product) {
+            return Err(Error::StateCorrupt);
+        }
+        let root = decode_canonical_envelope(original.as_bytes(), InputKind::Metadata)
+            .map_err(|_| Error::StateCorrupt)?;
+        let issue = root_issue(&root)?;
+        if root.signed().value()["product"] != product {
+            return Err(Error::StateCorrupt);
+        }
+        Ok(Self {
+            head: original.into(),
+            root_count: 0,
+            batch_count: 0,
+            latest_issue: issue,
+            product: product.into(),
+        })
+    }
+    pub(crate) fn advance(
+        &mut self,
+        batch: &ProductRootBatch,
+        mut read_root: impl FnMut(usize) -> Result<Vec<u8>>,
+        mut visit_members: impl FnMut(&mut dyn FnMut(&[String]) -> Result<()>) -> Result<()>,
+    ) -> Result<()> {
+        // Bound each object before copying or parsing it; independent Root
+        // originals are streamed rather than treated as one JSON array.
+        if batch.binding.product != self.product
+            || batch.evidence.base_root_count != self.root_count
+            || batch.successor_count == 0
+            || batch.evidence.request.len() > json::FRAME_MAX
+            || batch.evidence.response.len() > json::FRAME_MAX
+            || batch.evidence.policy.len() > json::RECORD_MAX
+        {
+            return Err(Error::StateCorrupt);
+        }
+        batch.binding.validate()?;
+        batch.evidence.incarnation.validate()?;
+        check_denied(&batch.evidence.denied_key_ids)?;
+        batch.evidence.sent.data()?;
+        batch.evidence.received.data()?;
+        let mut evidence = batch.evidence.clone();
+        evidence.base_root_count = 0;
+        let mut latest_issue = self.latest_issue;
+        let mut fingerprint = Sha256::new();
+        let mut reads = 0usize;
+        let mut head = None;
+        evidence.verify_source(
+            &batch.binding,
+            self.head.as_bytes(),
+            batch.successor_count,
+            |index| {
+                let raw = read_root(index)?;
+                if raw.len() > json::RECORD_MAX {
+                    return Err(Error::StateCorrupt);
+                }
+                if reads < batch.successor_count {
+                    if index != reads {
+                        return Err(Error::StateCorrupt);
+                    }
+                    let envelope = decode_canonical_envelope(&raw, InputKind::Metadata)
+                        .map_err(|_| Error::StateCorrupt)?;
+                    latest_issue = latest_issue.max(root_issue(&envelope)?);
+                    fingerprint_root(&mut fingerprint, index, &raw);
+                    if index + 1 == batch.successor_count {
+                        head = Some(raw.clone());
+                    }
+                }
+                reads = reads.checked_add(1).ok_or(Error::Unavailable)?;
+                Ok(std::borrow::Cow::Owned(raw))
+            },
+        )?;
+        let fingerprint = fingerprint.finalize();
+        let response =
+            decode_canonical_envelope(evidence.response.as_bytes(), InputKind::Credential)
+                .map_err(|_| Error::StateCorrupt)?;
+        let mut member_error = None;
+        let visit_result = visit_members(&mut |ids| {
+            let result = (|| {
+                check_denied(ids)?;
+                if ids.is_empty() {
+                    return Ok(());
+                }
+                let mut denied = response.signatures().iter().any(|signature| {
+                    ids.binary_search_by(|id| id.as_str().cmp(signature.key_id()))
+                        .is_ok()
+                });
+                let mut observed = Sha256::new();
+                for index in 0..batch.successor_count {
+                    let raw = read_root(index)?;
+                    if raw.len() > json::RECORD_MAX {
+                        return Err(Error::StateCorrupt);
+                    }
+                    fingerprint_root(&mut observed, index, &raw);
+                    let envelope = decode_canonical_envelope(&raw, InputKind::Metadata)
+                        .map_err(|_| Error::StateCorrupt)?;
+                    denied |= envelope.signatures().iter().any(|signature| {
+                        ids.binary_search_by(|id| id.as_str().cmp(signature.key_id()))
+                            .is_ok()
+                    });
+                }
+                if observed.finalize() != fingerprint {
+                    return Err(Error::StateCorrupt);
+                }
+                if denied {
+                    return Err(Error::ScopeConflict);
+                }
+                Ok(())
+            })();
+            if result.is_err() && member_error.is_none() {
+                member_error = Some(result);
+            }
+            result
+        });
+        if let Some(error) = member_error {
+            return error;
+        }
+        visit_result?;
+        if latest_issue > evidence.earliest {
+            return Err(Error::StateCorrupt);
+        }
+        let root_count = self
+            .root_count
+            .checked_add(batch.successor_count)
+            .ok_or(Error::StateCorrupt)?;
+        let batch_count = self.batch_count.checked_add(1).ok_or(Error::StateCorrupt)?;
+        self.head =
+            String::from_utf8(head.ok_or(Error::StateCorrupt)?).map_err(|_| Error::StateCorrupt)?;
+        self.root_count = root_count;
+        self.batch_count = batch_count;
+        self.latest_issue = latest_issue;
+        Ok(())
+    }
+    pub(crate) fn finish(
+        &self,
+        expected_batches: u64,
+        expected_roots: usize,
+        expected_head_sha256: &str,
+    ) -> Result<()> {
+        if self.batch_count != expected_batches
+            || self.root_count != expected_roots
+            || !json::digest(expected_head_sha256)
+            || json::sha256(self.head.as_bytes()) != expected_head_sha256
+        {
+            return Err(Error::StateCorrupt);
+        }
+        Ok(())
+    }
+    /// Return the replayed Root only after checking the authenticated head
+    /// facts. A caller must still retain and recheck its protected read set.
+    pub(crate) fn finish_root(
+        &self,
+        expected_batches: u64,
+        expected_roots: usize,
+        expected_head_sha256: &str,
+    ) -> Result<&[u8]> {
+        self.finish(expected_batches, expected_roots, expected_head_sha256)?;
+        Ok(self.head.as_bytes())
+    }
+    /// The maximum issuance time belongs to the same authenticated prefix as
+    /// the returned Root, not merely to the last Root in that prefix.
+    pub(crate) fn finish_latest_issue(
+        &self,
+        expected_batches: u64,
+        expected_roots: usize,
+        expected_head_sha256: &str,
+    ) -> Result<u64> {
+        self.finish(expected_batches, expected_roots, expected_head_sha256)?;
+        Ok(self.latest_issue)
+    }
+}
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Status {
     Unknown,
     CleanupPending,
     CleanupVerifiedZero,
+}
+/// Exact protected product history position associated with this member's
+/// time evidence. These bytes are only a reference, never authentication.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ProductRootPosition {
+    pub(crate) head_sha256: String,
+    pub(crate) root_sha256: String,
+    pub(crate) batch: u64,
+    pub(crate) root_count: u64,
+}
+impl ProductRootPosition {
+    fn validate(&self) -> Result<()> {
+        if !json::digest(&self.head_sha256)
+            || !json::digest(&self.root_sha256)
+            || self.batch > json::SAFE_MAX
+            || self.root_count > json::SAFE_MAX
+            || (self.batch == 0) != (self.root_count == 0)
+            || self.batch > self.root_count
+        {
+            return Err(Error::StateCorrupt);
+        }
+        Ok(())
+    }
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -414,6 +656,8 @@ pub(crate) struct State {
     pub(crate) floor: Option<u64>,
     /// Exact canonical successors, starting at immutable original Root + 1.
     pub(crate) roots: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) product_root: Option<ProductRootPosition>,
     pub(crate) denied_key_ids: Vec<String>,
     pub(crate) evidence: Option<Evidence>,
 }
@@ -432,6 +676,7 @@ impl State {
             zero_retention: None,
             floor: None,
             roots: Vec::new(),
+            product_root: None,
             denied_key_ids: Vec::new(),
             evidence: None,
         };
@@ -482,8 +727,72 @@ impl State {
         Ok(s)
     }
     pub(crate) fn validate(&self, original: &[u8]) -> Result<()> {
+        self.validate_common()?;
+        // A detached state cannot authenticate a product history reference.
+        // The protected owner must validate it with the same locked read set.
+        if self.product_root.is_some() {
+            return Err(Error::PrerequisiteUnavailable);
+        }
+        let mut version = root_version(original, &self.binding.product)?;
+        for root in &self.roots {
+            let next = root_version(root.as_bytes(), &self.binding.product)?;
+            if version.checked_add(1) != Some(next) {
+                return Err(Error::StateCorrupt);
+            }
+            version = next;
+        }
+        match &self.evidence {
+            None if self.floor.is_none()
+                && self.roots.is_empty()
+                && self.status == Status::Unknown => {}
+            Some(e) if self.floor == Some(e.earliest) && self.incarnation.is_some() => {
+                e.verify(&self.binding, original, &self.roots)?;
+                if !e
+                    .denied_key_ids
+                    .iter()
+                    .all(|id| self.denied_key_ids.contains(id))
+                {
+                    return Err(Error::StateCorrupt);
+                }
+            }
+            _ => return Err(Error::StateCorrupt),
+        }
+        Ok(())
+    }
+    /// Validate local compact-state invariants only. The protected history
+    /// owner must independently authenticate the exact position and evidence
+    /// before accepting this state or applying any transition.
+    pub(crate) fn validate_compact_shape(&self) -> Result<()> {
+        self.validate_common()?;
+        if self.product_root.is_none() {
+            return Err(Error::StateCorrupt);
+        }
+        match &self.evidence {
+            None if self.floor.is_none() && self.status == Status::Unknown => Ok(()),
+            Some(e) if self.floor == Some(e.earliest) && self.incarnation.is_some() => {
+                if !e
+                    .denied_key_ids
+                    .iter()
+                    .all(|id| self.denied_key_ids.contains(id))
+                {
+                    return Err(Error::StateCorrupt);
+                }
+                Ok(())
+            }
+            _ => Err(Error::StateCorrupt),
+        }
+    }
+    // This checks only local state shape. It never authenticates a Root or
+    // evidence and must not be used as a standalone source of authority.
+    pub(crate) fn validate_common(&self) -> Result<()> {
         self.binding.validate()?;
         check_denied(&self.denied_key_ids)?;
+        if let Some(position) = &self.product_root {
+            position.validate()?;
+            if !self.roots.is_empty() {
+                return Err(Error::StateCorrupt);
+            }
+        }
         if self.protocol_version != 1
             || self.revision == 0
             || self.revision > json::SAFE_MAX
@@ -517,30 +826,6 @@ impl State {
                 self.status,
                 self.incarnation.as_ref(),
             )?;
-        }
-        let mut version = root_version(original, &self.binding.product)?;
-        for root in &self.roots {
-            let next = root_version(root.as_bytes(), &self.binding.product)?;
-            if version.checked_add(1) != Some(next) {
-                return Err(Error::StateCorrupt);
-            }
-            version = next;
-        }
-        match &self.evidence {
-            None if self.floor.is_none()
-                && self.roots.is_empty()
-                && self.status == Status::Unknown => {}
-            Some(e) if self.floor == Some(e.earliest) && self.incarnation.is_some() => {
-                e.verify(&self.binding, original, &self.roots)?;
-                if !e
-                    .denied_key_ids
-                    .iter()
-                    .all(|id| self.denied_key_ids.contains(id))
-                {
-                    return Err(Error::StateCorrupt);
-                }
-            }
-            _ => return Err(Error::StateCorrupt),
         }
         Ok(())
     }
@@ -612,6 +897,93 @@ impl State {
                     || e.base_root_count != self.roots.len()
                     || self.policy_fault.as_ref().is_some_and(PolicyFault::is_active)
                         && self.evidence.as_ref().is_some_and(|old| old.request == e.request)
+                {
+                    return Err(Error::StateCorrupt);
+                }
+            }
+        }
+        Ok(())
+    }
+    /// Transition shape for independently authenticated compact positions.
+    /// Both positions and evidence must first be replayed against the same
+    /// protected product Head by the native owner; this method grants no trust.
+    pub(crate) fn transition_compact_shape(&self, next: &Self, previous: &[u8]) -> Result<()> {
+        next.validate_compact_shape()?;
+        PolicyFault::transition(
+            self.policy_fault.as_ref(),
+            next.policy_fault.as_ref(),
+            next.status,
+            next.revision,
+            previous,
+        )?;
+        let target = next.product_root.as_ref().ok_or(Error::StateCorrupt)?;
+        let old = self.product_root.as_ref();
+        if self.binding != next.binding
+            || next.revision != self.revision.checked_add(1).ok_or(Error::Unavailable)?
+            || next.previous_sha256 != Some(json::sha256(previous))
+            || next.floor.unwrap_or(0) < self.floor.unwrap_or(0)
+            || !self
+                .denied_key_ids
+                .iter()
+                .all(|id| next.denied_key_ids.contains(id))
+            || old.is_none() && !self.roots.is_empty()
+            || old.is_some_and(|p| {
+                match (
+                    target.batch.checked_sub(p.batch),
+                    target.root_count.checked_sub(p.root_count),
+                ) {
+                    (Some(batches), Some(roots)) => {
+                        roots < batches || (batches == 0 && target != p)
+                    }
+                    _ => true,
+                }
+            })
+        {
+            return Err(Error::StateCorrupt);
+        }
+        let same_position = old == Some(target);
+        let joining = old.is_none()
+            && self.floor.is_none()
+            && self.evidence.is_none()
+            && self.status == Status::Unknown;
+        match next.status {
+            Status::Unknown => {
+                if next.floor != self.floor
+                    || next.evidence != self.evidence
+                    || (!same_position && !joining)
+                {
+                    return Err(Error::StateCorrupt);
+                }
+            }
+            Status::CleanupVerifiedZero => {
+                if !same_position
+                    || self.status != Status::CleanupPending
+                    || next.floor != self.floor
+                    || next.evidence != self.evidence
+                    || next.denied_key_ids != self.denied_key_ids
+                    || next.incarnation != self.incarnation
+                {
+                    return Err(Error::StateCorrupt);
+                }
+            }
+            Status::CleanupPending => {
+                let evidence = next.evidence.as_ref().ok_or(Error::StateCorrupt)?;
+                let base = old.map_or(0, |p| p.root_count);
+                if next.incarnation != self.incarnation
+                    || Some(&evidence.incarnation) != next.incarnation.as_ref()
+                    || next.denied_key_ids != evidence.denied_key_ids
+                    || evidence.floor_before < self.floor.unwrap_or(0)
+                    || u64::try_from(evidence.base_root_count)
+                        .ok()
+                        .is_none_or(|count| count < base || count > target.root_count)
+                    || self
+                        .policy_fault
+                        .as_ref()
+                        .is_some_and(PolicyFault::is_active)
+                        && self
+                            .evidence
+                            .as_ref()
+                            .is_some_and(|old| old.request == evidence.request)
                 {
                     return Err(Error::StateCorrupt);
                 }
@@ -847,6 +1219,55 @@ mod live_interval_tests {
 mod tests {
     use super::*;
     #[test]
+    fn product_replay_retries_4097_signed_roots_after_missing_final_object() {
+        let fixture = long_root_fixture::generate();
+        let (state, _, _) = anchored();
+        let mut evidence = state.evidence.unwrap();
+        evidence.request = serde_json::to_string(&fixture.request).unwrap();
+        evidence.response = String::from_utf8(fixture.response).unwrap();
+        evidence.sent = CounterEvidence::from_data(
+            CounterObservation::from_bracket(100_000, 90_000, 90_000, 100_000).unwrap(),
+        );
+        evidence.received = CounterEvidence::from_data(
+            CounterObservation::from_bracket(200_000, 190_000, 190_000, 200_000).unwrap(),
+        );
+        evidence.floor_before = 0;
+        evidence.base_root_count = 0;
+        evidence.earliest = 99_995;
+        evidence.latest = 100_015;
+        let batch = ProductRootBatch {
+            binding: binding(),
+            successor_count: fixture.roots.len(),
+            evidence,
+        };
+        assert_eq!(batch.successor_count, 4097);
+        let mut replay =
+            ProductRootReplay::new("pinvou", std::str::from_utf8(&fixture.original).unwrap())
+                .unwrap();
+        assert_eq!(
+            replay.advance(
+                &batch,
+                |i| {
+                    if i == 4096 {
+                        Err(Error::Unavailable)
+                    } else {
+                        Ok(fixture.roots[i].clone())
+                    }
+                },
+                |visit| visit(&[])
+            ),
+            Err(Error::Unavailable)
+        );
+        replay
+            .advance(&batch, |i| Ok(fixture.roots[i].clone()), |visit| visit(&[]))
+            .unwrap();
+        assert!(
+            replay
+                .finish(1, 4097, &json::sha256(fixture.roots.last().unwrap()))
+                .is_ok()
+        );
+    }
+    #[test]
     fn initial_policy_is_canonical_and_bound_to_the_original_installation() {
         let b = binding();
         let policy = Policy::initial(b.clone()).unwrap();
@@ -1001,6 +1422,656 @@ mod tests {
             ),
             Err(Error::StateCorrupt)
         );
+    }
+
+    #[test]
+    fn compact_position_requires_protected_history_authentication() {
+        let (mut state, _, original) = anchored();
+        state.roots.clear();
+        state.product_root = Some(ProductRootPosition {
+            head_sha256: "a".repeat(64),
+            root_sha256: "b".repeat(64),
+            batch: 1,
+            root_count: 1,
+        });
+        assert!(state.validate_common().is_ok());
+        assert_eq!(
+            state.validate(&original),
+            Err(Error::PrerequisiteUnavailable)
+        );
+        state.roots.push("unverified".into());
+        assert_eq!(state.validate_common(), Err(Error::StateCorrupt));
+        state.roots.clear();
+        state.product_root.as_mut().unwrap().root_count = 0;
+        assert_eq!(state.validate_common(), Err(Error::StateCorrupt));
+        state.product_root.as_mut().unwrap().root_count = 1;
+        state.product_root.as_mut().unwrap().head_sha256 = "not-a-digest".into();
+        assert_eq!(state.validate_common(), Err(Error::StateCorrupt));
+    }
+
+    #[test]
+    fn compact_transition_shape_preserves_predecessor_and_time_floor() {
+        let (sample, _, original) = anchored();
+        let mut prior = State::genesis(sample.binding.clone(), &original).unwrap();
+        prior.incarnation = sample.incarnation.clone();
+        let mut next = prior
+            .next_unknown(prior.incarnation.clone().unwrap(), b"prior")
+            .unwrap();
+        let mut evidence = sample.evidence.unwrap();
+        evidence.base_root_count = 0;
+        evidence.floor_before = 0;
+        next.product_root = Some(ProductRootPosition {
+            head_sha256: "a".repeat(64),
+            root_sha256: "b".repeat(64),
+            batch: 1,
+            root_count: 1,
+        });
+        next.status = Status::CleanupPending;
+        next.floor = Some(evidence.earliest);
+        next.denied_key_ids = evidence.denied_key_ids.clone();
+        next.evidence = Some(evidence);
+        assert!(prior.transition_compact_shape(&next, b"prior").is_ok());
+        assert_eq!(
+            prior.transition_compact_shape(&next, b"different"),
+            Err(Error::StateCorrupt)
+        );
+        next.evidence.as_mut().unwrap().base_root_count = 2;
+        assert_eq!(
+            prior.transition_compact_shape(&next, b"prior"),
+            Err(Error::StateCorrupt)
+        );
+        next.evidence.as_mut().unwrap().base_root_count = 0;
+        next.floor = None;
+        assert_eq!(
+            prior.transition_compact_shape(&next, b"prior"),
+            Err(Error::StateCorrupt)
+        );
+    }
+
+    #[test]
+    fn compact_transition_rejects_insufficient_root_growth_and_preserves_state() {
+        let (sample, _, _) = anchored();
+        let mut prior = sample.clone();
+        prior.roots.clear();
+        prior.product_root = Some(ProductRootPosition {
+            head_sha256: "a".repeat(64),
+            root_sha256: "b".repeat(64),
+            batch: 1,
+            root_count: 2,
+        });
+        let incarnation = prior.incarnation.clone().unwrap();
+        let mut next = prior.next_unknown(incarnation.clone(), b"prior").unwrap();
+        assert!(prior.transition_compact_shape(&next, b"prior").is_ok());
+        next.floor = Some(prior.floor.unwrap() + 1);
+        assert_eq!(
+            prior.transition_compact_shape(&next, b"prior"),
+            Err(Error::StateCorrupt)
+        );
+        next = prior.next_unknown(incarnation.clone(), b"prior").unwrap();
+        prior.denied_key_ids.push("f".repeat(64));
+        assert_eq!(
+            prior.transition_compact_shape(&next, b"prior"),
+            Err(Error::StateCorrupt)
+        );
+        prior.denied_key_ids.clear();
+        next = prior.next_unknown(incarnation, b"prior").unwrap();
+        next.status = Status::CleanupPending;
+        let evidence = next.evidence.as_mut().unwrap();
+        evidence.floor_before = prior.floor.unwrap();
+        evidence.base_root_count = 2;
+        next.product_root = Some(ProductRootPosition {
+            head_sha256: "c".repeat(64),
+            root_sha256: "d".repeat(64),
+            batch: 3,
+            root_count: 4,
+        });
+        assert!(prior.transition_compact_shape(&next, b"prior").is_ok());
+        next.product_root.as_mut().unwrap().root_count = 1;
+        assert_eq!(
+            prior.transition_compact_shape(&next, b"prior"),
+            Err(Error::StateCorrupt)
+        );
+        next.product_root.as_mut().unwrap().root_count = 3;
+        assert_eq!(
+            prior.transition_compact_shape(&next, b"prior"),
+            Err(Error::StateCorrupt)
+        );
+        let mut zero = prior
+            .next_unknown(prior.incarnation.clone().unwrap(), b"prior")
+            .unwrap();
+        zero.status = Status::CleanupVerifiedZero;
+        assert_eq!(
+            prior.transition_compact_shape(&zero, b"prior"),
+            Err(Error::StateCorrupt)
+        );
+    }
+
+    #[test]
+    fn compact_transition_checks_valid_shapes_and_numeric_boundaries() {
+        let (sample, _, _) = anchored();
+        let mut prior = sample;
+        prior.roots.clear();
+        prior.product_root = Some(ProductRootPosition {
+            head_sha256: "a".repeat(64),
+            root_sha256: "b".repeat(64),
+            batch: 2,
+            root_count: 4,
+        });
+        let inc = prior.incarnation.clone().unwrap();
+        let mut next = prior.next_unknown(inc.clone(), b"prior").unwrap();
+        next.status = Status::CleanupPending;
+        next.evidence.as_mut().unwrap().floor_before = prior.floor.unwrap();
+        next.evidence.as_mut().unwrap().base_root_count = 4;
+        assert!(prior.transition_compact_shape(&next, b"prior").is_ok());
+        for position in [
+            ProductRootPosition {
+                head_sha256: "c".repeat(64),
+                root_sha256: "d".repeat(64),
+                batch: 3,
+                root_count: 3,
+            },
+            ProductRootPosition {
+                head_sha256: "c".repeat(64),
+                root_sha256: "d".repeat(64),
+                batch: 1,
+                root_count: 4,
+            },
+            ProductRootPosition {
+                head_sha256: "c".repeat(64),
+                root_sha256: "b".repeat(64),
+                batch: 2,
+                root_count: 4,
+            },
+            ProductRootPosition {
+                head_sha256: "a".repeat(64),
+                root_sha256: "b".repeat(64),
+                batch: 2,
+                root_count: 5,
+            },
+        ] {
+            let mut bad = next.clone();
+            bad.product_root = Some(position);
+            assert!(bad.validate_compact_shape().is_ok());
+            assert_eq!(
+                prior.transition_compact_shape(&bad, b"prior"),
+                Err(Error::StateCorrupt)
+            );
+        }
+        let mut complete = prior.next_unknown(inc, b"prior").unwrap();
+        complete.status = Status::CleanupVerifiedZero;
+        complete.cleanup_pending = false;
+        complete.zero_retention = Some(crate::retention_custody::ZeroRetentionReference {
+            completion_revision: complete.revision,
+            completion_sha256: "e".repeat(64),
+        });
+        assert!(prior.transition_compact_shape(&complete, b"prior").is_ok());
+        let fault = prior
+            .next_policy_fault(prior.incarnation.clone().unwrap(), b"prior", "f".repeat(64))
+            .unwrap();
+        assert!(prior.transition_compact_shape(&fault, b"prior").is_ok());
+        let mut erased = fault
+            .next_unknown(fault.incarnation.clone().unwrap(), b"fault")
+            .unwrap();
+        erased.policy_fault = None;
+        assert_eq!(
+            fault.transition_compact_shape(&erased, b"fault"),
+            Err(Error::StateCorrupt)
+        );
+        let mut at_limit = prior.clone();
+        at_limit.product_root.as_mut().unwrap().batch = json::SAFE_MAX - 1;
+        at_limit.product_root.as_mut().unwrap().root_count = json::SAFE_MAX - 1;
+        let mut max_next = at_limit
+            .next_unknown(at_limit.incarnation.clone().unwrap(), b"limit")
+            .unwrap();
+        max_next.status = Status::CleanupPending;
+        max_next.evidence.as_mut().unwrap().floor_before = at_limit.floor.unwrap();
+        max_next.evidence.as_mut().unwrap().base_root_count =
+            usize::try_from(json::SAFE_MAX - 1).unwrap();
+        let target = max_next.product_root.as_mut().unwrap();
+        target.batch = json::SAFE_MAX;
+        target.root_count = json::SAFE_MAX;
+        target.head_sha256 = "c".repeat(64);
+        target.root_sha256 = "d".repeat(64);
+        assert!(
+            at_limit
+                .transition_compact_shape(&max_next, b"limit")
+                .is_ok()
+        );
+        prior.revision = json::SAFE_MAX;
+        assert_eq!(
+            prior
+                .next_unknown(prior.incarnation.clone().unwrap(), b"prior")
+                .err(),
+            Some(Error::Unavailable)
+        );
+    }
+
+    #[test]
+    fn product_root_history_replays_signed_batches_with_historical_denials() {
+        #[derive(Clone)]
+        struct TestBatch {
+            batch: ProductRootBatch,
+            successors: Vec<String>,
+            member_denies: Vec<Vec<String>>,
+        }
+        impl std::ops::Deref for TestBatch {
+            type Target = ProductRootBatch;
+            fn deref(&self) -> &Self::Target {
+                &self.batch
+            }
+        }
+        impl std::ops::DerefMut for TestBatch {
+            fn deref_mut(&mut self) -> &mut Self::Target {
+                &mut self.batch
+            }
+        }
+        fn advance(cursor: &mut ProductRootReplay, batch: &TestBatch) -> Result<()> {
+            cursor.advance(
+                &batch.batch,
+                |i| {
+                    batch
+                        .successors
+                        .get(i)
+                        .map(|r| r.as_bytes().to_vec())
+                        .ok_or(Error::Unavailable)
+                },
+                |visit| {
+                    for member in &batch.member_denies {
+                        visit(member)?;
+                    }
+                    Ok(())
+                },
+            )
+        }
+        let fixture: serde_json::Value = serde_json::from_slice(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/product-root-history.json"
+        )))
+        .unwrap();
+        let original = fixture["original"].as_str().unwrap().as_bytes();
+        let (state, _, _) = anchored();
+        let template = state.evidence.unwrap();
+        let mut batches: Vec<TestBatch> = fixture["batches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                let mut evidence = template.clone();
+                evidence.request = serde_json::to_string(&entry["request"]).unwrap();
+                evidence.response = entry["response"].as_str().unwrap().into();
+                evidence.base_root_count = if index == 0 { 0 } else { 2 };
+                evidence.earliest = entry["earliest"].as_u64().unwrap();
+                evidence.latest = entry["latest"].as_u64().unwrap();
+                TestBatch {
+                    batch: ProductRootBatch {
+                        binding: binding(),
+                        evidence,
+                        successor_count: entry["successors"].as_array().unwrap().len(),
+                    },
+                    successors: entry["successors"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|root| root.as_str().unwrap().into())
+                        .collect(),
+                    member_denies: vec![vec![]],
+                }
+            })
+            .collect();
+        // Each batch carries its own authenticated profile binding and policy.
+        batches[1].binding.profile_id = "other-profile".into();
+        let mut other_policy = policy();
+        other_policy.binding = batches[1].binding.clone();
+        batches[1].evidence.policy =
+            String::from_utf8(json::encode(&other_policy, false).unwrap()).unwrap();
+        let expected_head = json::sha256(batches[1].successors[0].as_bytes());
+        let replay = |batches: &[TestBatch]| -> Result<()> {
+            let mut cursor =
+                ProductRootReplay::new("pinvou", std::str::from_utf8(original).unwrap())?;
+            for batch in batches {
+                advance(&mut cursor, batch)?;
+            }
+            cursor.finish(2, 3, &expected_head)
+        };
+        assert!(matches!(
+            ProductRootReplay::new("pinvou", &"x".repeat(json::RECORD_MAX + 1)),
+            Err(Error::StateCorrupt)
+        ));
+        // Each batch-level bound rejects before the root or member source is
+        // accessed. Every failed attempt leaves this cursor usable for retry.
+        let mut cursor =
+            ProductRootReplay::new("pinvou", std::str::from_utf8(original).unwrap()).unwrap();
+        for kind in 0..4 {
+            let mut bad = batches[0].clone();
+            match kind {
+                0 => bad.evidence.request = "x".repeat(json::FRAME_MAX + 1),
+                1 => bad.evidence.response = "x".repeat(json::FRAME_MAX + 1),
+                2 => bad.evidence.policy = "x".repeat(json::RECORD_MAX + 1),
+                _ => bad.successor_count = 0,
+            }
+            let mut reads = 0;
+            let mut visits = 0;
+            assert_eq!(
+                cursor.advance(
+                    &bad.batch,
+                    |_| {
+                        reads += 1;
+                        Err(Error::Unavailable)
+                    },
+                    |_| {
+                        visits += 1;
+                        Ok(())
+                    }
+                ),
+                Err(Error::StateCorrupt)
+            );
+            assert_eq!((reads, visits), (0, 0));
+        }
+        let mut reads = 0;
+        let mut visits = 0;
+        assert_eq!(
+            cursor.advance(
+                &batches[0].batch,
+                |_| {
+                    reads += 1;
+                    Ok(vec![b'x'; json::RECORD_MAX + 1])
+                },
+                |_| {
+                    visits += 1;
+                    Ok(())
+                }
+            ),
+            Err(Error::StateCorrupt)
+        );
+        assert_eq!((reads, visits), (1, 0));
+        let mut reads = 0;
+        assert_eq!(
+            cursor.advance(
+                &batches[0].batch,
+                |i| {
+                    reads += 1;
+                    if reads > 4 {
+                        Ok(vec![b'x'; json::RECORD_MAX + 1])
+                    } else {
+                        Ok(batches[0].successors[i].as_bytes().to_vec())
+                    }
+                },
+                |visit| visit(&["f".repeat(64)])
+            ),
+            Err(Error::StateCorrupt)
+        );
+        assert_eq!(reads, 5);
+        advance(&mut cursor, &batches[0]).unwrap();
+        advance(&mut cursor, &batches[1]).unwrap();
+        assert_eq!(cursor.finish(2, 3, &expected_head), Ok(()));
+        let historical_issue = cursor.finish_latest_issue(2, 3, &expected_head).unwrap();
+        assert!(historical_issue > 1_700_000_000_195);
+        assert!(historical_issue > root_issue_bytes(batches[1].successors[0].as_bytes()).unwrap());
+        assert_eq!(
+            check_history_time_bound(historical_issue, 1_700_000_000_195),
+            Err(Error::StateCorrupt)
+        );
+        assert_eq!(
+            check_history_time_bound(historical_issue, historical_issue),
+            Ok(())
+        );
+        assert!(cursor.finish_latest_issue(2, 3, &"0".repeat(64)).is_err());
+        let mut cursor =
+            ProductRootReplay::new("pinvou", std::str::from_utf8(original).unwrap()).unwrap();
+        let mut reads = 0;
+        assert_eq!(
+            cursor.advance(
+                &batches[0].batch,
+                |i| {
+                    reads += 1;
+                    if reads > 4 && i == 0 {
+                        Ok(batches[0].successors[1].as_bytes().to_vec())
+                    } else {
+                        Ok(batches[0].successors[i].as_bytes().to_vec())
+                    }
+                },
+                |visit| visit(&["f".repeat(64)])
+            ),
+            Err(Error::StateCorrupt)
+        );
+        let mut reads = 0;
+        assert_eq!(
+            cursor.advance(
+                &batches[0].batch,
+                |i| {
+                    reads += 1;
+                    if reads > 4 {
+                        Err(Error::Unavailable)
+                    } else {
+                        Ok(batches[0].successors[i].as_bytes().to_vec())
+                    }
+                },
+                |visit| visit(&["f".repeat(64)])
+            ),
+            Err(Error::Unavailable)
+        );
+        advance(&mut cursor, &batches[0]).unwrap();
+        let first: serde_json::Value = serde_json::from_str(&batches[0].successors[0]).unwrap();
+        let second: serde_json::Value = serde_json::from_str(&batches[1].successors[0]).unwrap();
+        let historical = first["signatures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["keyId"].as_str().unwrap())
+            .find(|id| {
+                !second["signatures"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|s| s["keyId"] == *id)
+            })
+            .unwrap()
+            .to_owned();
+        batches[1].member_denies.push(vec![historical.clone()]);
+        assert_eq!(replay(&batches), Ok(()));
+        assert_eq!(replay(&batches[..1]), Err(Error::StateCorrupt));
+        let mut bad = batches.clone();
+        bad[1].binding.profile_id = "unmatched-profile".into();
+        assert_eq!(replay(&bad), Err(Error::StateCorrupt));
+        let mut bad = batches.clone();
+        bad[0].member_denies.push(vec![historical]);
+        assert_eq!(replay(&bad), Err(Error::ScopeConflict));
+        let signer = serde_json::from_str::<serde_json::Value>(&batches[1].evidence.response)
+            .unwrap()["signatures"][0]["keyId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let mut bad = batches.clone();
+        bad[1].member_denies.push(vec![signer]);
+        assert_eq!(replay(&bad), Err(Error::ScopeConflict));
+        let mut bad = batches.clone();
+        bad[1].evidence.base_root_count = 0;
+        assert_eq!(replay(&bad), Err(Error::StateCorrupt));
+        let mut bad = batches.clone();
+        bad.swap(0, 1);
+        assert_eq!(replay(&bad), Err(Error::StateCorrupt));
+        let mut bad = batches.clone();
+        bad[1].evidence.response = batches[0].evidence.response.clone();
+        assert_eq!(replay(&bad), Err(Error::StateCorrupt));
+        let mut bad = batches.clone();
+        bad[1].successors[0].push(' ');
+        assert_eq!(replay(&bad), Err(Error::StateCorrupt));
+        let mut bad = batches.clone();
+        bad[1].member_denies.push(vec!["invalid".into()]);
+        assert_eq!(replay(&bad), Err(Error::StateCorrupt));
+        let mut bad = batches.clone();
+        bad[1].successors.clear();
+        assert_eq!(replay(&bad), Err(Error::Unavailable));
+        // The intermediate Root of a multi-successor batch is also checked.
+        let intermediate: serde_json::Value =
+            serde_json::from_str(&batches[0].successors[0]).unwrap();
+        let mut bad = batches.clone();
+        bad[0].member_denies.push(vec![
+            intermediate["signatures"][0]["keyId"]
+                .as_str()
+                .unwrap()
+                .into(),
+        ]);
+        assert_eq!(replay(&bad), Err(Error::ScopeConflict));
+        // This signed response passes against its immediate predecessor, but
+        // predates an earlier Root's issuedAt and therefore fails full replay.
+        let mut bad = batches.clone();
+        bad[1].evidence.response = fixture["batches"][1]["earlyResponse"]
+            .as_str()
+            .unwrap()
+            .into();
+        bad[1].evidence.earliest = 1_700_000_000_195;
+        bad[1].evidence.latest = 1_700_000_000_225;
+        let mut standalone = bad[1].evidence.clone();
+        standalone.base_root_count = 0;
+        assert_eq!(
+            standalone.verify(
+                &bad[1].binding,
+                bad[0].successors[1].as_bytes(),
+                &bad[1].successors
+            ),
+            Ok(())
+        );
+        // A newly caught-up member checks the exact current Root without
+        // successors. Signature verification alone also accepts this early
+        // response; its authenticated history bound must reject it.
+        assert_eq!(
+            standalone.verify(&bad[1].binding, bad[1].successors[0].as_bytes(), &[]),
+            Ok(())
+        );
+        let mut complete =
+            ProductRootReplay::new("pinvou", std::str::from_utf8(original).unwrap()).unwrap();
+        advance(&mut complete, &batches[0]).unwrap();
+        advance(&mut complete, &batches[1]).unwrap();
+        let bound = complete.finish_latest_issue(2, 3, &expected_head).unwrap();
+        assert_eq!(
+            check_history_time_bound(bound, standalone.earliest),
+            Err(Error::StateCorrupt)
+        );
+        assert_eq!(replay(&bad), Err(Error::StateCorrupt));
+        let mut cursor =
+            ProductRootReplay::new("pinvou", std::str::from_utf8(original).unwrap()).unwrap();
+        advance(&mut cursor, &batches[0]).unwrap();
+        assert_eq!(advance(&mut cursor, &bad[1]), Err(Error::StateCorrupt));
+        advance(&mut cursor, &batches[1]).unwrap();
+        assert_eq!(cursor.finish(2, 3, &expected_head), Ok(()));
+        // Change a signature while preserving canonical envelope encoding.
+        let mut bad = batches.clone();
+        let mut response: serde_json::Value =
+            serde_json::from_str(&bad[1].evidence.response).unwrap();
+        let signature = response["signatures"][0]["signature"].as_str().unwrap();
+        let replacement = if signature.starts_with('A') { "B" } else { "A" };
+        response["signatures"][0]["signature"] =
+            format!("{}{}", replacement, &signature[1..]).into();
+        bad[1].evidence.response = serde_json::to_string(&response).unwrap();
+        assert!(
+            decode_canonical_envelope(bad[1].evidence.response.as_bytes(), InputKind::Credential)
+                .unwrap()
+                .check_full_schema()
+                .is_ok()
+        );
+        let mut altered = bad[1].evidence.clone();
+        altered.base_root_count = 0;
+        assert_eq!(
+            altered.verify(
+                &bad[1].binding,
+                bad[0].successors[1].as_bytes(),
+                &bad[1].successors
+            ),
+            Err(Error::StateCorrupt)
+        );
+        assert_eq!(replay(&bad), Err(Error::StateCorrupt));
+        let mut bad_root = batches.clone();
+        let mut root: serde_json::Value = serde_json::from_str(&bad_root[0].successors[0]).unwrap();
+        let signature = root["signatures"][0]["signature"].as_str().unwrap();
+        let replacement = if signature.starts_with('A') { "B" } else { "A" };
+        root["signatures"][0]["signature"] = format!("{}{}", replacement, &signature[1..]).into();
+        bad_root[0].successors[0] = serde_json::to_string(&root).unwrap();
+        assert!(
+            decode_canonical_envelope(bad_root[0].successors[0].as_bytes(), InputKind::Metadata)
+                .unwrap()
+                .check_full_schema()
+                .is_ok()
+        );
+        assert_eq!(replay(&bad_root), Err(Error::StateCorrupt));
+        let mut denied = batches[1].clone();
+        let signer = response["signatures"][0]["keyId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        denied.member_denies.push(vec![signer]);
+        let mut cursor =
+            ProductRootReplay::new("pinvou", std::str::from_utf8(original).unwrap()).unwrap();
+        advance(&mut cursor, &batches[0]).unwrap();
+        assert_eq!(advance(&mut cursor, &denied), Err(Error::ScopeConflict));
+        assert_eq!(
+            cursor.advance(
+                &batches[1].batch,
+                |i| Ok(batches[1].successors[i].as_bytes().to_vec()),
+                |_| Err(Error::Unavailable)
+            ),
+            Err(Error::Unavailable)
+        );
+        assert_eq!(
+            cursor.advance(
+                &batches[1].batch,
+                |i| Ok(batches[1].successors[i].as_bytes().to_vec()),
+                |visit| {
+                    let _ = visit(denied.member_denies.last().unwrap());
+                    Ok(())
+                }
+            ),
+            Err(Error::ScopeConflict)
+        );
+        advance(&mut cursor, &batches[1]).unwrap();
+        assert_eq!(cursor.finish(2, 3, &expected_head), Ok(()));
+        let mut many = batches.clone();
+        many[1]
+            .member_denies
+            .extend((0..4097).map(|i| vec![format!("{i:064x}")]));
+        assert_eq!(replay(&many), Ok(()));
+        many[1]
+            .member_denies
+            .push(denied.member_denies.last().unwrap().clone());
+        assert_eq!(replay(&many), Err(Error::ScopeConflict));
+        let mut limits = batches.clone();
+        limits[1]
+            .member_denies
+            .push((0..4096).map(|i| format!("{i:064x}")).collect());
+        assert_eq!(replay(&limits), Ok(()));
+        limits[1]
+            .member_denies
+            .last_mut()
+            .unwrap()
+            .push(format!("{:064x}", 4096));
+        assert_eq!(replay(&limits), Err(Error::StateCorrupt));
+        let mut bad = batches.clone();
+        bad[1].member_denies = vec![vec!["f".repeat(64); 4097]];
+        assert_eq!(replay(&bad), Err(Error::StateCorrupt));
+        let mut cursor =
+            ProductRootReplay::new("pinvou", std::str::from_utf8(original).unwrap()).unwrap();
+        advance(&mut cursor, &batches[0]).unwrap();
+        assert_eq!(advance(&mut cursor, &bad[1]), Err(Error::StateCorrupt));
+        advance(&mut cursor, &batches[1]).unwrap();
+        assert_eq!(
+            cursor.finish(1, 3, &expected_head),
+            Err(Error::StateCorrupt)
+        );
+        assert_eq!(
+            cursor.finish(2, 2, &expected_head),
+            Err(Error::StateCorrupt)
+        );
+        assert_eq!(
+            cursor.finish(2, 3, &"f".repeat(64)),
+            Err(Error::StateCorrupt)
+        );
+        assert_eq!(cursor.finish(2, 3, &expected_head), Ok(()));
+        assert_eq!(
+            cursor.finish_root(2, 3, &expected_head).unwrap(),
+            batches[1].successors.last().unwrap().as_bytes()
+        );
+        assert!(cursor.finish_root(2, 3, &"f".repeat(64)).is_err());
     }
 
     fn vector() -> serde_json::Value {

@@ -65,10 +65,14 @@ fn main() {
     };
     // The destructive-by-design isolated test adapter is unavailable to all
     // shipping profiles, including ordinary lab builds and empty inputs.
-    if env::var_os("CARGO_FEATURE_METADATA_COMPONENT_TESTS").is_some()
-        && (seed.as_slice() != include_bytes!("tests/metadata-component-fixture/seed.json")
-            || root.as_slice() != include_bytes!("tests/metadata-component-fixture/root.json"))
-    {
+    let fixed_metadata_fixture = (seed.as_slice()
+        == include_bytes!("tests/metadata-component-fixture/seed.json")
+        && root.as_slice() == include_bytes!("tests/metadata-component-fixture/root.json"))
+        || (seed.as_slice()
+            == include_bytes!("tests/metadata-component-history-fixture/seed.json")
+            && root.as_slice()
+                == include_bytes!("tests/metadata-component-history-fixture/root.json"));
+    if env::var_os("CARGO_FEATURE_METADATA_COMPONENT_TESTS").is_some() && !fixed_metadata_fixture {
         panic!("HOST_METADATA_TEST_INPUTS_REQUIRED");
     }
     build_input::validate_profile_mode(

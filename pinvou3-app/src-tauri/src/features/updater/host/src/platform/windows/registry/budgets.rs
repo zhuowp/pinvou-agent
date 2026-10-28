@@ -734,15 +734,15 @@ impl Store {
         let tx = Handle::owned(unsafe {
             CreateTransaction(ptr::null_mut(), ptr::null_mut(), 0, 0, 0, 0, ptr::null())
         })?;
-        let actual = self
-            .read_in(seed, Some(&tx))?
+        let actual = time::read_guarded_in(self, seed, &_product_guard, &tx)?
             .ok_or(Error::SetupIncomplete)?;
         host.authenticate_running(&actual)?;
         if actual.digest()? != before.digest()? {
             return Err(Error::ScopeConflict);
         }
         let private = self.key(true, Some(&tx))?.ok_or(Error::SetupIncomplete)?;
-        let publication = self.publish_budget_in(host, &actual, &private, &tx, id, command)?;
+        let publication =
+            self.publish_budget_in(host, &actual, &private, &_product_guard, &tx, id, command)?;
         drop(private);
         if unsafe { CommitTransaction(tx.raw()) } == 0 {
             return Err(Error::StateCommitUnknown);
@@ -762,6 +762,7 @@ impl Store {
         host: &StartedServiceContext,
         actual: &HostRegistration,
         private: &Key,
+        guard: &super::product_catalog::ProductGuard,
         tx: &Handle,
         id: &WindowId,
         command: Command,
@@ -776,7 +777,7 @@ impl Store {
         let old = read_window(&key, &head, id, Some(tx))?;
         // The time source is constructed here from the exact protected native
         // key and original transaction, never supplied by this method's caller.
-        let source = match time::current_in(private, &host.context.seed, actual, tx) {
+        let source = match time::current_in(private, &host.context.seed, actual, guard, tx) {
             Ok(s) => Some(s),
             Err(
                 Error::PrerequisiteUnavailable
@@ -931,8 +932,7 @@ impl Store {
         if read(&key, "Head")? != head_raw {
             return Err(Error::ScopeConflict);
         }
-        let final_host = self
-            .read_in(&host.context.seed, Some(tx))?
+        let final_host = time::read_guarded_in(self, &host.context.seed, guard, tx)?
             .ok_or(Error::SetupIncomplete)?;
         host.authenticate_running(&final_host)?;
         if final_host.digest()? != actual.digest()? {

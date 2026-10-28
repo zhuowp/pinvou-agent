@@ -117,6 +117,7 @@ fn open(
     }
     let mut current = None;
     for (i, part) in parts.iter().enumerate() {
+        super::time_cancel::check()?;
         let handle = current.as_ref().map_or(parent, |key: &Key| key.0);
         let rights = KEY_WOW64_64KEY
             | KEY_READ
@@ -282,6 +283,18 @@ fn read_payload_size(returned: usize, allocated: usize) -> Result<()> {
 }
 #[allow(unsafe_code)]
 fn read(key: &Key, name: &str) -> Result<Vec<u8>> {
+    read_limited(key, name, json::RECORD_MAX)
+}
+fn read_allocation_size(kind: u32, size: u32, limit: usize) -> Result<usize> {
+    let size = size as usize;
+    if kind != REG_BINARY || size == 0 || size > json::RECORD_MAX || size > limit {
+        return Err(Error::StateCorrupt);
+    }
+    Ok(size)
+}
+#[allow(unsafe_code)]
+fn read_limited(key: &Key, name: &str, limit: usize) -> Result<Vec<u8>> {
+    super::time_cancel::check()?;
     let name = wide(name);
     let mut kind = 0;
     let mut size = 0;
@@ -296,10 +309,8 @@ fn read(key: &Key, name: &str) -> Result<Vec<u8>> {
         )
     };
     read_query_status(status)?;
-    if kind != REG_BINARY || size == 0 || size as usize > json::RECORD_MAX {
-        return Err(Error::StateCorrupt);
-    }
-    let mut bytes = vec![0u8; size as usize];
+    let allocation = read_allocation_size(kind, size, limit)?;
+    let mut bytes = vec![0u8; allocation];
     let status = unsafe {
         RegQueryValueExW(
             key.0,
@@ -374,6 +385,7 @@ fn owner_bootstrap_in(
     seed: &Seed,
     record: &HostRegistration,
     tx: Option<&Handle>,
+    verify_product: bool,
 ) -> Result<()> {
     if !crate::bootstrap::initialized(&record.known_owner_namespaces) {
         for name in [
@@ -390,7 +402,10 @@ fn owner_bootstrap_in(
         &read(key, METADATA_BOOTSTRAP_ROOT)?,
         &read(key, PREPARATION_BOOTSTRAP)?,
     )?;
-    product_catalog::check(seed, record, tx)
+    if verify_product {
+        product_catalog::check(seed, record, tx)?;
+    }
+    Ok(())
 }
 
 fn decode_record(bytes: &[u8], seed: &Seed) -> Result<HostRegistration> {
@@ -514,8 +529,14 @@ impl Store {
         }
         Ok(key)
     }
+    #[allow(unsafe_code)]
     pub(super) fn read(&self, seed: &Seed) -> Result<Option<HostRegistration>> {
-        self.read_in(seed, None)
+        let _bootstrap = BootstrapGuard::acquire(seed, false)?;
+        let guard = product_catalog::ProductGuard::acquire(seed)?;
+        let tx = Handle::owned(unsafe {
+            CreateTransaction(ptr::null_mut(), ptr::null_mut(), 0, 0, 0, 0, ptr::null())
+        })?;
+        time::read_guarded_in(self, seed, &guard, &tx)
     }
     /// Recheck a revision-one first-install intent before either resuming it
     /// or changing its installer. The caller holds the bootstrap mutex.
@@ -568,6 +589,28 @@ impl Store {
         seed: &Seed,
         transaction: Option<&Handle>,
     ) -> Result<Option<HostRegistration>> {
+        self.read_in_checked(seed, transaction, true)
+    }
+
+    /// Provisional registration for the product history owner only. The same
+    /// guarded transaction must subsequently authenticate the entire product
+    /// directory and Root history before this record can be used or committed.
+    fn read_for_root_history_in(
+        &self,
+        seed: &Seed,
+        guard: &product_catalog::ProductGuard,
+        transaction: &Handle,
+    ) -> Result<Option<HostRegistration>> {
+        guard.check_seed(seed)?;
+        self.read_in_checked(seed, Some(transaction), false)
+    }
+
+    fn read_in_checked(
+        &self,
+        seed: &Seed,
+        transaction: Option<&Handle>,
+        verify_product: bool,
+    ) -> Result<Option<HostRegistration>> {
         // Only complete absence of the profile leaf is a fresh namespace.
         // An orphan public/private fragment must never be adopted/reset.
         let Some(_profile) = open(HKEY_LOCAL_MACHINE, &self.path, false, transaction)? else {
@@ -614,7 +657,7 @@ impl Store {
             return Err(Error::StateCorrupt);
         }
         self.inventory_in(&key, seed, &record)?;
-        owner_bootstrap_in(&key, seed, &record, transaction)?;
+        owner_bootstrap_in(&key, seed, &record, transaction, verify_product)?;
         Ok(Some(record))
     }
     /// Every private read authenticates the SAME complete committed inventory.
@@ -749,15 +792,13 @@ impl Store {
         } else {
             None
         };
-        let _product_guard = if expected.is_none() {
-            Some(product_catalog::ProductGuard::acquire(seed)?)
-        } else {
-            None
-        };
+        // Product Root census reads every member's current host registration.
+        // Serialize all registration revisions with that census, not only enrollment.
+        let _product_guard = product_catalog::ProductGuard::acquire(seed)?;
         let transaction = Handle::owned(unsafe {
             CreateTransaction(ptr::null_mut(), ptr::null_mut(), 0, 0, 0, 0, ptr::null())
         })?;
-        let actual = self.read_in(seed, Some(&transaction))?;
+        let actual = time::read_guarded_in(self, seed, &_product_guard, &transaction)?;
         match (expected, actual.as_ref()) {
             (None, None) if next.revision == 1 && initial_manifest.is_some() => {}
             (Some(expected), Some(actual))
@@ -858,7 +899,9 @@ impl Store {
                 PREPARATION_BOOTSTRAP,
                 owners.ownership.record_bytes(),
             )?;
-            owner_bootstrap_in(&private, seed, next, Some(&transaction))?;
+            // Full product directory/history authentication follows once the
+            // entire initial namespace and inventory have been staged.
+            owner_bootstrap_in(&private, seed, next, Some(&transaction), false)?;
             metadata::initialize_in(&private, &transaction, seed, next)?;
             time::initialize_in(&private, &transaction, next)?;
             budgets::initialize_in(&private, &transaction, next)?;
@@ -878,6 +921,11 @@ impl Store {
             // Root and every used shard are in this SAME native transaction.
             // Read exact namespace/payloads before closing all tx handles.
             self.inventory_in(&private, seed, next)?;
+        }
+        let staged = time::read_guarded_in(self, seed, &_product_guard, &transaction)?
+            .ok_or(Error::StateCorrupt)?;
+        if staged.digest()? != next.digest()? {
+            return Err(Error::ScopeConflict);
         }
         // Every native transaction key is closed BEFORE the definitive commit.
         drop(public);
@@ -1037,6 +1085,34 @@ mod inventory_namespace_tests {
 #[cfg(test)]
 mod read_availability_tests {
     use super::*;
+    #[test]
+    fn size_query_enforces_the_caller_limit_before_allocation() {
+        assert_eq!(read_allocation_size(REG_BINARY, 1, json::FRAME_MAX), Ok(1));
+        assert_eq!(
+            read_allocation_size(REG_BINARY, json::FRAME_MAX as u32, json::FRAME_MAX),
+            Ok(json::FRAME_MAX)
+        );
+        assert_eq!(
+            read_allocation_size(REG_BINARY, (json::FRAME_MAX + 1) as u32, json::FRAME_MAX),
+            Err(Error::StateCorrupt)
+        );
+        assert_eq!(
+            read_allocation_size(REG_BINARY, json::RECORD_MAX as u32, json::RECORD_MAX),
+            Ok(json::RECORD_MAX)
+        );
+        assert_eq!(
+            read_allocation_size(REG_BINARY, (json::RECORD_MAX + 1) as u32, usize::MAX),
+            Err(Error::StateCorrupt)
+        );
+        assert_eq!(
+            read_allocation_size(REG_BINARY, 0, json::FRAME_MAX),
+            Err(Error::StateCorrupt)
+        );
+        assert_eq!(
+            read_allocation_size(0, 1, json::FRAME_MAX),
+            Err(Error::StateCorrupt)
+        );
+    }
     #[test]
     fn failed_os_reads_do_not_claim_confirmed_corruption() {
         use windows_sys::Win32::Foundation::{

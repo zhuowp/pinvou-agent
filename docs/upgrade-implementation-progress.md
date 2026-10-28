@@ -1,5 +1,16 @@
 # Upgrade implementation progress
 
+2026-10-29 Windows T27 continuation candidate: the
+[native historical source component](client-upgrade-native-history.md) now
+connects actual same-transaction waterlog samples to historical signed time and
+full graph/high-water replay, with a protected never-committed scratch index.
+A cached historical anchor now reauthenticates earlier separated evidence
+before and after sample use. This remains a candidate under independent review;
+it is not production acceptance or T27 completion. Ordinary native Windows
+tests and the compile-only historical component fixture are available; direct
+HKCU TxR tests fail on this device with ERROR_RM_NOT_ACTIVE (6801). Production
+Root/write gates stay closed. No E2E or deployment was run.
+
 2026-10-29 migration continuation: restored client-01 at `6fb672cec` and
 matched all 37 saved file SHA-256 digests. The isolated delivery scope is the
 [supplied source metadata component](client-upgrade-source-metadata.md): exact

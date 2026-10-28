@@ -79,11 +79,7 @@ pub(super) fn sample_live_time<'read, 'tx>(
         evidence.received.data()?,
         current.counters(),
     )?;
-    check_root_interval(
-        state.current_root(source.original_root()),
-        &state.binding.product,
-        bounds,
-    )?;
+    check_root_interval(source.current_root(), &state.binding.product, bounds)?;
     // Fixed same-TX source recheck detects Head/Policy/current host movement
     // during counter acquisition. It cannot clear a barrier or initialize an
     // absent owner. The interval remains at current's actual sample, not the

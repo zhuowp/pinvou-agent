@@ -1088,6 +1088,7 @@ dependencies = [
  "pinvou-upgrade-package-check",
  "pinvou-upgrade-transfer",
  "pinvou-upgrade-verifier",
+ "ring",
  "serde",
  "serde_json",
  "sha2",

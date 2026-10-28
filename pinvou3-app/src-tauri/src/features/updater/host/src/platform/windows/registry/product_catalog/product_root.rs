@@ -116,6 +116,31 @@ pub(super) fn check_in(
     Ok(())
 }
 
+/// Authenticate the immutable genesis while a product-history owner holds
+/// the product lock and a single transaction. This does not authenticate the
+/// advanced Head; the caller must replay and bind the entire protected history.
+pub(in crate::platform::windows::registry) fn check_history_base_in(
+    product: &Key,
+    tx: &Handle,
+    first_event: &[u8],
+    root: &[u8],
+) -> Result<Vec<u8>> {
+    let raw = genesis(first_event, root)?;
+    let key = entry(product, NAMESPACE, Some(tx))?;
+    exact(&key, true, &["Genesis", "Head"])?;
+    exact(&key, false, &["history", "history-v2"])?;
+    let history = entry(&key, "history", Some(tx))?;
+    exact(&history, true, &[])?;
+    exact(&history, false, &["0000000000000001"])?;
+    let first = entry(&history, &revision_name(1), Some(tx))?;
+    exact(&first, true, &["Record"])?;
+    exact(&first, false, &[])?;
+    if read(&key, "Genesis")? != raw || read(&first, "Record")? != raw {
+        return Err(Error::StateCorrupt);
+    }
+    Ok(raw)
+}
+
 #[allow(unsafe_code)]
 pub(super) fn flush(product: &Key) -> Result<()> {
     let key = entry(product, NAMESPACE, None)?;

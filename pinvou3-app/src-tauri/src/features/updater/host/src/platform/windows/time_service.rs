@@ -1,6 +1,9 @@
 //! One owned worker: startup once, then only explicit authenticated App requests.
 //! A single pending/running latch rejects overlap; no delayed retry queue.
-use super::{dispatch::Core, pipe::Event, time_owner::TimeOwner, time_transport::TimeTransport};
+use super::{
+    dispatch::Core, pipe::Event, time_cancel::WorkerCancelScope, time_owner::TimeOwner,
+    time_transport::TimeTransport,
+};
 use crate::{
     TrustedTimeState, TrustedTimeStatus,
     error::{Error, Result},
@@ -170,6 +173,8 @@ impl TimeWorker {
                 // Construct before runtime creation. Build errors, early returns and
                 // unwinding all permanently close this worker's request entrance.
                 let _exit = WorkerExit(core.time.clone());
+                let _cancel_scope =
+                    WorkerCancelScope::enter(thread_cancel.clone(), thread_stop.clone())?;
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
