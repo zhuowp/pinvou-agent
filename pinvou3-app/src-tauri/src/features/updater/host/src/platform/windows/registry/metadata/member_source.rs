@@ -15,6 +15,17 @@ use std::collections::BTreeMap;
 
 type ProductGuard = super::super::product_catalog::ProductGuard;
 
+/// Complete validated current source fingerprint DATA, with no caller callback.
+pub(in crate::platform::windows::registry) fn fingerprint_members<'prefix, 'tx>(
+    seed: &'tx Seed,
+    requester: &HostRegistration,
+    guard: &'tx ProductGuard,
+    tx: &'tx Handle,
+    prefix: Option<&'prefix RootSignaturePrefix<'tx>>,
+) -> Result<[u8; 32]> {
+    census(seed, requester, guard, tx, prefix, |_| Ok(()))
+}
+
 /// Private construction binds this view to an actual catalog member source.
 /// The index used for complete water replay is ephemeral and is not retained.
 pub(in crate::platform::windows::registry) struct MemberMetadataView<'member, 'prefix, 'tx> {

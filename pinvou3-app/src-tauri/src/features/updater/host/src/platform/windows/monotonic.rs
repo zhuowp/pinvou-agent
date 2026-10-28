@@ -63,6 +63,30 @@ impl IncarnationCounterSample {
 }
 
 impl StartedServiceContext {
+    /// The Root publisher has already completed the guarded history replay.
+    /// Its private capability pins actual registration keys in that same TxR,
+    /// avoiding history-sized Store::read work after the native observation.
+    /// Actual SCM/process/registration checks still bracket these Win32 calls.
+    pub(super) fn sample_monotonic_for_root(
+        &self,
+        source: &super::registry::time::RootPublicationClock<'_>,
+    ) -> Result<IncarnationCounterSample> {
+        source.registration(self)?;
+        let counters = read_counters()?;
+        let after = source.registration(self)?;
+        let startup = after
+            .startup_attestation
+            .as_ref()
+            .ok_or(Error::SetupIncomplete)?;
+        let binding = IncarnationBinding {
+            installation_scope_id: after.installation_scope_id.clone(),
+            host_epoch: after.host_epoch,
+            instance_nonce: startup.instance_nonce.clone(),
+            process: self.context.process.selector.clone(),
+        };
+        Ok(IncarnationCounterSample { binding, counters })
+    }
+
     /// This is intentionally absent from InstalledServiceContext: its startup
     /// incarnation has not yet committed. No ordinary-process/test source port.
     /// Every read authenticates the real running SCM/PID, retained image and

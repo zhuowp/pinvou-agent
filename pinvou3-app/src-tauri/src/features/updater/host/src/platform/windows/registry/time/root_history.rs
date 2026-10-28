@@ -3,7 +3,11 @@
 //! a replay, or authorize committing any transaction.
 #![allow(dead_code)]
 use super::*;
+mod publication;
 use crate::trusted_time::{ProductRootBatch, ProductRootReplay};
+pub(super) use publication::StagedV2Batch;
+#[cfg(feature = "metadata-component-tests")]
+pub(in crate::platform::windows::registry) use publication::component_fixture;
 use sha2::{Digest, Sha256};
 mod prefix;
 #[cfg(feature = "metadata-component-tests")]

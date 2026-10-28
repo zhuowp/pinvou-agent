@@ -71,7 +71,9 @@ fn main() {
         || (seed.as_slice()
             == include_bytes!("tests/metadata-component-history-fixture/seed.json")
             && root.as_slice()
-                == include_bytes!("tests/metadata-component-history-fixture/root.json"));
+                == include_bytes!("tests/metadata-component-history-fixture/root.json"))
+        || (seed.as_slice() == include_bytes!("tests/root-publication-fixture/seed.json")
+            && root.as_slice() == include_bytes!("tests/root-publication-fixture/root.json"));
     if env::var_os("CARGO_FEATURE_METADATA_COMPONENT_TESTS").is_some() && !fixed_metadata_fixture {
         panic!("HOST_METADATA_TEST_INPUTS_REQUIRED");
     }

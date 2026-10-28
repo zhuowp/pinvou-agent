@@ -234,13 +234,16 @@ jobs:
               - 'pinvou3-app/scripts/tauri/windows-host-build.js'
               - 'pinvou3-app/tests/windows_host_packaging.test.js'
               - 'scripts/metadata-component-fixture.mjs'
+              - 'scripts/root-publication-fixture.mjs'
               - 'scripts/tests/test_ci_gate_policy.py'
               - 'specs/upgrade/v1/**'
             rust_code:
               - 'pinvou3-app/src-tauri/src/features/updater/host/tests/metadata-component-fixture/**'
               - 'pinvou3-app/src-tauri/src/features/updater/host/tests/metadata-component-history-fixture/**'
+              - 'pinvou3-app/src-tauri/src/features/updater/host/tests/root-publication-fixture/**'
               - 'pinvou3-app/src-tauri/src/features/updater/host/tests/product-root-history.json'
               - 'scripts/metadata-component-fixture.mjs'
+              - 'scripts/root-publication-fixture.mjs'
               - 'scripts/tests/test_ci_gate_policy.py'
               - 'pinvou3-app/src/shared/i18n/startup-admission.js'
               - 'pinvou3-app/src-tauri/src/features/updater/download/archive/**'
@@ -278,6 +281,8 @@ jobs:
               - 'pinvou3-app/src/shared/i18n/startup-admission.js'
               # The signed host history fixture is read by Windows host tests.
               - 'pinvou3-app/src-tauri/src/features/updater/host/tests/product-root-history.json'
+              - 'pinvou3-app/src-tauri/src/features/updater/host/tests/root-publication-fixture/**'
+              - 'scripts/root-publication-fixture.mjs'
               # Round-1 fix wave (PR #715 review): the loong64 cross-pipeline
               # scripts are build inputs of the rust legs — the pr-check
               # rust-loongarch64-check leg executes the toolchain/sysroot
@@ -2057,6 +2062,20 @@ jobs:
           if ($code -ne 0 -or @($historyOutputLines | Where-Object { $_ -eq 'PINVOU_METADATA_COMPONENT_TEST_PASSED' }).Count -ne 1 -or
               @($historyOutputLines | Where-Object { $_ -eq 'PINVOU_SIGNED_ROOT_HISTORY_TEST_PASSED' }).Count -ne 1) {
             throw 'Signed-history metadata component test failed or did not run'
+          }
+          # A third fixed public anchor exercises the complete signed nonempty
+          # cache and V2 Root-staging DATA path without constructing SCM proof.
+          $dir = Join-Path $env:GITHUB_WORKSPACE 'pinvou3-app/src-tauri/src/features/updater/host/tests/root-publication-fixture'
+          $env:PINVOU_HOST_BOOTSTRAP_SEED = Join-Path $dir 'seed.json'
+          $env:PINVOU_HOST_INITIAL_ROOT = Join-Path $dir 'root.json'
+          if ((Get-FileHash -Algorithm SHA256 -LiteralPath $env:PINVOU_HOST_BOOTSTRAP_SEED).Hash -ne '9A5E28885011A906CB110D3DFACE077C31D1B37CF5D2EE0C234C3DD436F7E6F9' -or
+              (Get-FileHash -Algorithm SHA256 -LiteralPath $env:PINVOU_HOST_INITIAL_ROOT).Hash -ne '1C3BB9951401944B4DC684478BEF71D440F46A3B140EE5246406FDB319FBB9F3') { throw 'Unexpected public Root-publication fixture' }
+          $output = cargo run --manifest-path pinvou3-app/src-tauri/src/features/updater/host/Cargo.toml --target x86_64-pc-windows-msvc --locked --features metadata-component-tests --bin metadata-component-test 2>&1 | Tee-Object -Variable publicationOutputLines
+          $code = $LASTEXITCODE
+          $output | ForEach-Object { Write-Host $_ }
+          if ($code -ne 0 -or @($publicationOutputLines | Where-Object { $_ -eq 'PINVOU_METADATA_COMPONENT_TEST_PASSED' }).Count -ne 1 -or
+              @($publicationOutputLines | Where-Object { $_ -eq 'PINVOU_ROOT_PUBLICATION_DATA_TEST_PASSED' }).Count -ne 1) {
+            throw 'Root-publication metadata component test failed or did not run'
           }
 
 

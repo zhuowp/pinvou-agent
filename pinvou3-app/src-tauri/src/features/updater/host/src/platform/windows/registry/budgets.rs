@@ -11,6 +11,8 @@ use crate::{
 use serde::{Deserialize, Serialize};
 
 mod publication;
+mod root_acceptance;
+pub(super) use root_acceptance::PendingRootFloor;
 
 pub(super) const NAMESPACE: &str = "time-budgets-v1";
 const MAX_WINDOWS: usize = 4096;
@@ -358,7 +360,7 @@ pub(super) fn retain_samples_floor_in(
             .earliest_millis()
             .max(initial.bounds().earliest_millis())
     });
-    if head.live_floor.is_some_and(|old| old >= lower) {
+    if head.live_floor.is_some_and(|floor| floor >= lower) {
         return Ok(());
     }
     let mut next = head.clone();
