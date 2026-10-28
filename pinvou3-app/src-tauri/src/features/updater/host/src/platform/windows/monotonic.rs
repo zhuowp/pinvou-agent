@@ -63,6 +63,28 @@ impl IncarnationCounterSample {
 }
 
 impl StartedServiceContext {
+    /// Same-TxR metadata finalization has already completed all source replay.
+    /// Only bounded protected pins and actual SCM checks surround these calls.
+    pub(super) fn sample_monotonic_for_metadata(
+        &self,
+        source: &super::registry::time::MetadataFinalization<'_, '_>,
+    ) -> Result<IncarnationCounterSample> {
+        source.registration(self)?;
+        let counters = read_counters()?;
+        let after = source.registration(self)?;
+        let startup = after
+            .startup_attestation
+            .as_ref()
+            .ok_or(Error::SetupIncomplete)?;
+        let binding = IncarnationBinding {
+            installation_scope_id: after.installation_scope_id.clone(),
+            host_epoch: after.host_epoch,
+            instance_nonce: startup.instance_nonce.clone(),
+            process: self.context.process.selector.clone(),
+        };
+        Ok(IncarnationCounterSample { binding, counters })
+    }
+
     /// The Root publisher has already completed the guarded history replay.
     /// Its private capability pins actual registration keys in that same TxR,
     /// avoiding history-sized Store::read work after the native observation.

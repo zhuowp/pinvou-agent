@@ -1,5 +1,15 @@
 # Upgrade implementation progress
 
+2026-10-29 T27 metadata final observation: a
+[prepared native view](client-upgrade-metadata-final-observation.md) separates
+complete callback/source/original replay from bounded final sampling and commit.
+A distinct native final-observation type is required by the journal writer;
+Root decoding and complete history traversal precede its actual counter read.
+The existing journal schema, floor, expiry and uncertain-outcome rules remain.
+Real SCM/TxR publication and restart remain unverified under the local 6801
+environment limitation. Online metadata/application update-check integration and
+full T27 are still incomplete. No E2E or deployment was run.
+
 2026-10-29 T27 production Root publication component: the actual TimeOwner routes
 nonempty streamed successors through the
 [protected V2 publication operation](client-upgrade-root-publication.md).

@@ -404,8 +404,11 @@ impl Store {
         if policy::read_in(&metadata, &Binding::from_host(&actual))?.1 != role_raw {
             return Err(Error::ScopeConflict);
         }
-        source.recheck(host)?;
-        let final_sample = initial.refresh(host)?;
+        // Seal only after all callbacks, prior queries and original-byte loops
+        // finish. Preparation completes full source/custody replay before the
+        // dedicated sampler's actual final counter observation.
+        let finalization = source.prepare_metadata_finalization(host)?;
+        let final_sample = finalization.observe(host, &initial)?;
         require_fresh(initial.bounds(), final_sample.bounds(), minimum_expiry)?;
         budgets::retain_samples_floor_in(
             &private,
@@ -435,12 +438,16 @@ impl Store {
         if read(&metadata, "Head")? != head || read(&row, "Record")? != head {
             return Err(Error::ScopeConflict);
         }
-        source.recheck(host)?;
+        finalization.recheck(host)?;
+        if read(&metadata, "Policy")? != role_raw {
+            return Err(Error::ScopeConflict);
+        }
         let budget_key =
             open(private.0, budgets::NAMESPACE, false, Some(&tx))?.ok_or(Error::StateCorrupt)?;
         let budget_head = read(&budget_key, "Head")?;
         let sampled = final_sample.bounds();
         drop(final_sample);
+        drop(finalization);
         drop(initial);
         drop(prefix);
         drop(source);

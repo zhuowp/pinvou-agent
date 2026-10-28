@@ -22,6 +22,29 @@ pub(super) struct LiveTimeInterval<'read, 'tx> {
     bounds: UtcInterval,
 }
 impl<'read, 'tx> LiveTimeInterval<'read, 'tx> {
+    /// Final metadata observation only. Its sealed source completed full replay
+    /// before this call; no generic sampler/source replay follows the counter.
+    pub(super) fn recheck_metadata(
+        &self,
+        host: &StartedServiceContext,
+        finalization: &super::registry::time::MetadataFinalization<'read, 'tx>,
+    ) -> Result<Self> {
+        finalization.require_source(self.source)?;
+        let current = host.sample_monotonic_for_metadata(finalization)?;
+        current.elapsed_since(&self.current)?;
+        let bounds = finalization.bounds_at(current.counters())?;
+        if bounds.earliest_millis() < self.bounds.earliest_millis()
+            || bounds.latest_millis() < self.bounds.latest_millis()
+        {
+            return Err(Error::SourceUnavailable);
+        }
+        Ok(Self {
+            source: self.source,
+            current,
+            bounds,
+        })
+    }
+
     pub(super) fn belongs_to(&self, source: &LiveTimeReadSet<'_>) -> bool {
         std::ptr::eq(self.source, source)
     }

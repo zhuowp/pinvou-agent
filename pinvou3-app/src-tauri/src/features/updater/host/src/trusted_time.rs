@@ -1094,6 +1094,24 @@ pub(crate) fn advance_interval(
 /// Context/window checks only. Actual Root custody and the accepted continuous
 /// signature lineage belong to the native source, not this pure DATA helper.
 pub(crate) fn check_root_interval(raw: &[u8], product: &str, interval: UtcInterval) -> Result<()> {
+    prepare_root_window(raw, product)?.check(interval)
+}
+
+/// Schema/context-checked numeric DATA only; no Root custody or clock authority.
+pub(crate) struct PreparedRootWindow {
+    issued: u64,
+    expires: u64,
+}
+impl PreparedRootWindow {
+    pub(crate) fn check(&self, interval: UtcInterval) -> Result<()> {
+        if self.issued > interval.earliest || self.expires <= interval.latest {
+            return Err(Error::SourceUnavailable);
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn prepare_root_window(raw: &[u8], product: &str) -> Result<PreparedRootWindow> {
     let envelope = decode_canonical_envelope(raw, InputKind::Metadata)
         .map_err(|_| Error::StateCorrupt)?
         .check_full_schema()
@@ -1118,10 +1136,7 @@ pub(crate) fn check_root_interval(raw: &[u8], product: &str, interval: UtcInterv
     };
     let issued = time("issuedAt")?;
     let expires = time("expiresAt")?;
-    if issued > interval.earliest || expires <= interval.latest {
-        return Err(Error::SourceUnavailable);
-    }
-    Ok(())
+    Ok(PreparedRootWindow { issued, expires })
 }
 
 #[cfg(test)]
