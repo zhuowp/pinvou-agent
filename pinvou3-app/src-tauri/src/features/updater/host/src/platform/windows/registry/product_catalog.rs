@@ -1,5 +1,5 @@
 //! Protected, sharded original product/profile enrollment; not current Root authority.
-mod product_root;
+pub(super) mod product_root;
 use super::*;
 use crate::product_catalog::{Event, ProductEvent};
 use serde::{Deserialize, Serialize};
@@ -63,12 +63,34 @@ impl Drop for MachineGuard {
 /// Never acquire any other profile guard while holding this product guard.
 pub(in crate::platform::windows) struct ProductGuard {
     handle: Handle,
+    identity: ProductLockIdentity,
     _thread: PhantomData<Rc<()>>,
+}
+#[derive(PartialEq, Eq)]
+struct ProductLockIdentity {
+    kind: String,
+    product: String,
+}
+impl ProductLockIdentity {
+    fn new(kind: &str, product: &str) -> Result<Self> {
+        product_mutex_name(kind, product)?;
+        Ok(Self {
+            kind: kind.into(),
+            product: product.into(),
+        })
+    }
+    fn check(&self, kind: &str, product: &str) -> Result<()> {
+        if *self != Self::new(kind, product)? {
+            return Err(Error::ScopeConflict);
+        }
+        Ok(())
+    }
 }
 impl ProductGuard {
     #[allow(unsafe_code)]
     pub(in crate::platform::windows) fn acquire(seed: &Seed) -> Result<Self> {
         use windows_sys::Win32::Security::Authorization::SE_KERNEL_OBJECT;
+        let identity = ProductLockIdentity::new(&seed.profile_kind, &seed.product)?;
         let name = product_mutex_name(&seed.profile_kind, &seed.product)?;
         let security = NativeSecurity::mutex()?;
         let handle = Handle::owned(unsafe {
@@ -83,11 +105,15 @@ impl ProductGuard {
         match unsafe { WaitForSingleObject(handle.raw(), 0) } {
             WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(Self {
                 handle,
+                identity,
                 _thread: PhantomData,
             }),
             WAIT_TIMEOUT => Err(Error::Busy),
             _ => Err(Error::Unavailable),
         }
+    }
+    pub(in crate::platform::windows) fn check_seed(&self, seed: &Seed) -> Result<()> {
+        self.identity.check(&seed.profile_kind, &seed.product)
     }
 }
 fn product_mutex_name(kind: &str, product: &str) -> Result<String> {
@@ -167,9 +193,10 @@ impl Product {
 /// Visit one native name at a time. No logical profile-count cap or aggregate
 /// catalog buffer is introduced. Failed/overflowed native enumeration is unknown.
 #[allow(unsafe_code)]
-fn visit(key: &Key, values: bool, mut f: impl FnMut(&str) -> Result<()>) -> Result<()> {
+pub(super) fn visit(key: &Key, values: bool, mut f: impl FnMut(&str) -> Result<()>) -> Result<()> {
     let mut index = 0u32;
     loop {
+        super::super::time_cancel::check()?;
         let mut name = [0u16; 129];
         let mut length = name.len() as u32;
         let status = if values {
@@ -209,7 +236,7 @@ fn visit(key: &Key, values: bool, mut f: impl FnMut(&str) -> Result<()>) -> Resu
         index = index.checked_add(1).ok_or(Error::Unavailable)?;
     }
 }
-fn exact(key: &Key, values: bool, expected: &[&str]) -> Result<()> {
+pub(super) fn exact(key: &Key, values: bool, expected: &[&str]) -> Result<()> {
     let mut seen = vec![false; expected.len()];
     visit(key, values, |name| {
         let pos = expected
@@ -285,8 +312,9 @@ fn validate_product_history(
     }
     let history = entry(product, "history", tx)?;
     exact(&history, true, &[])?;
-    let first_root_binding = product_event_at(&history, 1, tx)?.1;
-    product_root::check_in(product, tx, &first_root_binding, &read(product, "Root")?)?;
+    // Root trust is verified separately for the target product after the
+    // complete directory has been authenticated. Other products cannot block
+    // this enrollment merely because their independent Root has advanced.
     let scopes = entry(product, "scopes", tx)?;
     exact(&scopes, true, &[])?;
     let mut previous: Option<(ProductEvent, Vec<u8>)> = None;
@@ -584,7 +612,8 @@ fn validate(key: &Key, seed: &Seed, tx: Option<&Handle>, head_raw: &[u8]) -> Res
     Ok(head)
 }
 
-fn load(seed: &Seed, tx: Option<&Handle>) -> Result<Option<(Event, Vec<u8>)>> {
+fn load(seed: &Seed, tx: &Handle, guard: &ProductGuard) -> Result<Option<(Event, Vec<u8>)>> {
+    let tx = Some(tx);
     let Some(key) = open(HKEY_LOCAL_MACHINE, &path(seed), false, tx)? else {
         return Ok(None);
     };
@@ -593,7 +622,23 @@ fn load(seed: &Seed, tx: Option<&Handle>) -> Result<Option<(Event, Vec<u8>)>> {
     if tx.is_none() && read(&key, "Head")? != raw {
         return Err(Error::ScopeConflict);
     }
-    checked.map(|head| Some((head, raw)))
+    let head = checked?;
+    let products = entry(&key, "products", tx)?;
+    if let Some(product) = open(
+        products.0,
+        &json::sha256(seed.product.as_bytes()),
+        false,
+        tx,
+    )? {
+        let history = entry(&product, "history", tx)?;
+        let first = product_event_at(&history, 1, tx)?.1;
+        let root = read(&product, "Root")?;
+        if product_root::check_in(&product, tx, &first, &root).is_err() {
+            let tx = tx.ok_or(Error::StateCorrupt)?;
+            super::time::verify_product_history_for_enrollment(seed, guard, tx)?;
+        }
+    }
+    Ok(Some((head, raw)))
 }
 fn require_no_profiles(seed: &Seed, tx: &Handle) -> Result<()> {
     let profiles = format!("Software\\Pinvou\\{}", seed.updater_leaf());
@@ -605,7 +650,8 @@ fn require_no_profiles(seed: &Seed, tx: &Handle) -> Result<()> {
 }
 
 pub(super) fn stage(seed: &Seed, host: &HostRegistration, tx: &Handle) -> Result<()> {
-    let old = load(seed, Some(tx))?;
+    let guard = ProductGuard::acquire(seed)?;
+    let old = load(seed, tx, &guard)?;
     if old.is_none() {
         require_no_profiles(seed, tx)?;
     }
@@ -697,7 +743,7 @@ pub(super) fn stage(seed: &Seed, host: &HostRegistration, tx: &Handle) -> Result
 pub(super) fn check(seed: &Seed, host: &HostRegistration, tx: Option<&Handle>) -> Result<()> {
     match tx {
         Some(tx) => visit_members_in(seed, host, tx, |_, _| Ok(())),
-        None => visit_members(seed, host, None, |_, _| Ok(())),
+        None => visit_members(seed, host, None, true, |_, _| Ok(())),
     }
 }
 
@@ -713,16 +759,33 @@ pub(super) fn visit_members_in(
     tx: &Handle,
     visit_member: impl FnMut(&Event, &HostRegistration) -> Result<()>,
 ) -> Result<()> {
-    visit_members(seed, host, Some(tx), visit_member)
+    visit_members(seed, host, Some(tx), true, visit_member)
+}
+
+/// Directory-only verification for the protected Root history owner. It does
+/// not authenticate the Root head: the same owner must replay that history in
+/// this transaction before using any callback result or committing.
+pub(super) fn visit_history_directory_in(
+    seed: &Seed,
+    host: &HostRegistration,
+    guard: &ProductGuard,
+    tx: &Handle,
+    visit_member: impl FnMut(&Event, &HostRegistration) -> Result<()>,
+) -> Result<()> {
+    guard.check_seed(seed)?;
+    visit_members(seed, host, Some(tx), false, visit_member)
 }
 
 fn visit_members(
     seed: &Seed,
     host: &HostRegistration,
     tx: Option<&Handle>,
+    require_genesis: bool,
     mut visit_member: impl FnMut(&Event, &HostRegistration) -> Result<()>,
 ) -> Result<()> {
-    let key = open(HKEY_LOCAL_MACHINE, &path(seed), false, tx)?.ok_or(Error::SetupIncomplete)?;
+    // A caller supplies an already authenticated profile registration. An
+    // absent catalog here cannot represent first installation.
+    let key = open(HKEY_LOCAL_MACHINE, &path(seed), false, tx)?.ok_or(Error::StateCorrupt)?;
     let products = entry(&key, "products", tx)?;
     let product_name = json::sha256(seed.product.as_bytes());
     let product = entry(&products, &product_name, tx)?;
@@ -733,22 +796,20 @@ fn visit_members(
     let anchor_raw = read(&anchor, "Record")?;
     let head_raw = read(&product, "Head")?;
     let mut found = false;
-    let checked = visit_product(
-        &product,
-        &product_name,
-        seed,
-        tx,
-        &head_raw,
-        |event, actual| {
-            if event.matches(seed, host) {
-                if found {
-                    return Err(Error::StateCorrupt);
-                }
-                found = true;
+    let mut visitor = |event: &Event, actual: &HostRegistration| {
+        if event.matches(seed, host) {
+            if found {
+                return Err(Error::StateCorrupt);
             }
-            visit_member(event, actual)
-        },
-    );
+            found = true;
+        }
+        visit_member(event, actual)
+    };
+    let checked = if require_genesis {
+        visit_product(&product, &product_name, seed, tx, &head_raw, &mut visitor)
+    } else {
+        visit_product_catalog(&product, &product_name, seed, tx, &head_raw, &mut visitor)
+    };
     if tx.is_none()
         && (read(&product, "Head")? != head_raw || read(&anchor, "Record")? != anchor_raw)
     {
@@ -781,6 +842,36 @@ fn visit_product(
     seed: &Seed,
     tx: Option<&Handle>,
     head_raw: &[u8],
+    visit_member: impl FnMut(&Event, &HostRegistration) -> Result<()>,
+) -> Result<()> {
+    exact(product, true, &["Record", "Root", "Head"])?;
+    exact(
+        product,
+        false,
+        &["members", "history", "scopes", "root-state-v1"],
+    )?;
+    let descriptor = record(product)?;
+    descriptor.check(product, product_name)?;
+    if descriptor.id != seed.product {
+        return Err(Error::StateCorrupt);
+    }
+    ProductEvent::parse(head_raw)?;
+    let history = entry(product, "history", tx)?;
+    exact(&history, true, &[])?;
+    let first_root_binding = product_event_at(&history, 1, tx)?.1;
+    product_root::check_in(product, tx, &first_root_binding, &read(product, "Root")?)?;
+    visit_product_catalog(product, product_name, seed, tx, head_raw, visit_member)
+}
+
+// Catalog verification is separate from Root replay so a future replay can
+// authenticate the directory without recursively invoking itself. Callbacks
+// remain provisional until the wrapper and the outer anchor checks succeed.
+fn visit_product_catalog(
+    product: &Key,
+    product_name: &str,
+    seed: &Seed,
+    tx: Option<&Handle>,
+    head_raw: &[u8],
     mut visit_member: impl FnMut(&Event, &HostRegistration) -> Result<()>,
 ) -> Result<()> {
     exact(product, true, &["Record", "Root", "Head"])?;
@@ -797,8 +888,6 @@ fn visit_product(
     let head = ProductEvent::parse(head_raw)?;
     let history = entry(product, "history", tx)?;
     exact(&history, true, &[])?;
-    let first_root_binding = product_event_at(&history, 1, tx)?.1;
-    product_root::check_in(product, tx, &first_root_binding, &read(product, "Root")?)?;
     let members = entry(product, "members", tx)?;
     exact(&members, true, &[])?;
     let scopes = entry(product, "scopes", tx)?;
@@ -931,12 +1020,96 @@ pub(super) fn verify_committed(seed: &Seed, host: &HostRegistration) -> Result<(
             return Err(Error::StateCommitUnknown);
         }
     }
-    check(seed, host, None)
+    let actual = Store::new(seed)
+        .read(seed)?
+        .ok_or(Error::StateCommitUnknown)?;
+    if actual.digest()? != host.digest()? {
+        return Err(Error::StateCommitUnknown);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[allow(unsafe_code)]
+    fn native_member_enumeration_stops_and_next_scope_can_retry() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let path = wide(&format!(
+            "Software\\PinvouTimeCancelTest-{}",
+            std::process::id()
+        ));
+        let mut raw = ptr::null_mut();
+        let mut disposition = 0;
+        assert_eq!(
+            unsafe {
+                RegCreateKeyExW(
+                    HKEY_CURRENT_USER,
+                    path.as_ptr(),
+                    0,
+                    ptr::null(),
+                    REG_OPTION_NON_VOLATILE,
+                    KEY_READ | KEY_WRITE,
+                    ptr::null(),
+                    &mut raw,
+                    &mut disposition,
+                )
+            },
+            0
+        );
+        assert_eq!(disposition, REG_CREATED_NEW_KEY);
+        struct Owned {
+            key: Option<Key>,
+            path: Vec<u16>,
+        }
+        impl Drop for Owned {
+            fn drop(&mut self) {
+                drop(self.key.take());
+                unsafe {
+                    RegDeleteTreeW(HKEY_CURRENT_USER, self.path.as_ptr());
+                }
+            }
+        }
+        let owned = Owned {
+            key: Some(Key(raw)),
+            path,
+        };
+        let key = owned.key.as_ref().unwrap();
+        for name in ["first", "second", "third"] {
+            write(key, name, b"x").unwrap();
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(crate::platform::windows::pipe::Event::new().unwrap());
+        let scope = crate::platform::windows::time_cancel::WorkerCancelScope::enter(
+            cancel.clone(),
+            stop.clone(),
+        )
+        .unwrap();
+        let mut observed = 0;
+        let result = visit(key, true, |_| {
+            observed += 1;
+            let stop = stop.clone();
+            std::thread::spawn(move || stop.set().unwrap())
+                .join()
+                .unwrap();
+            Ok(())
+        });
+        assert_eq!(result, Err(Error::TimeCanceled));
+        assert_eq!(observed, 1);
+        assert!(!cancel.load(Ordering::Acquire));
+        drop(scope);
+        let mut retry_count = 0;
+        visit(key, true, |_| {
+            retry_count += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(retry_count, 3);
+    }
     #[test]
     fn product_locks_are_scoped_by_exact_product_and_profile_kind() {
         let a = product_mutex_name("production", "product-a").unwrap();
@@ -945,6 +1118,15 @@ mod tests {
         assert_ne!(a, product_mutex_name("lab", "product-a").unwrap());
         assert!(product_mutex_name("unknown", "product-a").is_err());
         assert!(product_mutex_name("production", "bad/path").is_err());
+    }
+    #[test]
+    fn lock_identity_rejects_another_product_or_profile_kind() {
+        let identity = ProductLockIdentity::new("production", "product-a").unwrap();
+        assert!(identity.check("production", "product-a").is_ok());
+        assert!(identity.check("production", "product-b").is_err());
+        assert!(identity.check("lab", "product-a").is_err());
+        assert!(identity.check("unknown", "product-a").is_err());
+        assert!(identity.check("production", "bad/path").is_err());
     }
     #[test]
     fn history_names_use_exact_decimal_revision() {

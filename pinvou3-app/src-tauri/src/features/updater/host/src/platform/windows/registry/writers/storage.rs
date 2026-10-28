@@ -324,12 +324,12 @@ pub(super) fn commit(
     change: Change,
 ) -> Result<(Loaded, record::Row, Vec<u8>)> {
     let seed = &host.context.seed;
+    let product_guard = super::super::product_catalog::ProductGuard::acquire(seed)?;
     let tx = Handle::owned(unsafe {
         CreateTransaction(ptr::null_mut(), ptr::null_mut(), 0, 0, 0, 0, ptr::null())
     })?;
     let (wanted_head, wanted_row, row_id) = {
-        let actual = store
-            .read_in(seed, Some(&tx))?
+        let actual = super::super::time::read_guarded_in(store, seed, &product_guard, &tx)?
             .ok_or(Error::SetupIncomplete)?;
         host.authenticate_running(&actual)?;
         let private = store.key(true, Some(&tx))?.ok_or(Error::SetupIncomplete)?;

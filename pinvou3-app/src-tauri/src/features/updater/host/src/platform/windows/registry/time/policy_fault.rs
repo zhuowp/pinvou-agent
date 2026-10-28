@@ -34,12 +34,17 @@ impl Store {
         let tx = Handle::owned(unsafe {
             CreateTransaction(ptr::null_mut(), ptr::null_mut(), 0, 0, 0, 0, ptr::null())
         })?;
-        let actual = self
-            .read_in(seed, Some(&tx))?
-            .ok_or(Error::SetupIncomplete)?;
+        let actual =
+            read_guarded_in(self, seed, &_product_guard, &tx)?.ok_or(Error::SetupIncomplete)?;
         host.authenticate_running(&actual)?;
         let private = self.key(true, Some(&tx))?.ok_or(Error::SetupIncomplete)?;
-        let current = state_in(&private, &actual, Some(&tx))?;
+        let (current, verified) = if root_history::advanced_shape_in(seed, &tx)? {
+            let view = root_history::VerifiedHistory::open(seed, &actual, &_product_guard, &tx)?;
+            let current = state_in_product(&private, &actual, seed, &_product_guard, &tx, &view)?;
+            (current, Some(view))
+        } else {
+            (state_in(&private, &actual, Some(&tx))?, None)
+        };
         if current.raw != expected.raw || current.original_root != expected.original_root {
             return Err(Error::ScopeConflict);
         }
@@ -62,12 +67,19 @@ impl Store {
             &current.raw,
             policy_sha256,
         )?;
-        let raw = stage_state_in(&private, &actual, &current, &next, &tx)?;
+        let raw = stage_state_in(
+            &private,
+            &actual,
+            &current,
+            &next,
+            seed,
+            &_product_guard,
+            &tx,
+            verified.as_ref(),
+        )?;
         drop(time);
         drop(private);
-        if unsafe { CommitTransaction(tx.raw()) } == 0 {
-            return Err(Error::StateCommitUnknown);
-        }
+        commit_time_transaction(&tx)?;
         drop(tx);
         let verify = || -> Result<()> {
             let after = self.read(seed)?.ok_or(Error::StateCommitUnknown)?;
@@ -87,7 +99,7 @@ impl Store {
             if unsafe { RegFlushKey(time.0) } != 0 || unsafe { RegFlushKey(history.0) } != 0 {
                 return Err(Error::StateCommitUnknown);
             }
-            if state_in(&private, &after, None)?.raw != raw {
+            if self.time_load(seed, &after)?.raw != raw {
                 return Err(Error::StateCommitUnknown);
             }
             Ok(())

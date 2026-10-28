@@ -602,14 +602,14 @@ impl ProtectedKeeperIntent {
         next.previous_sha256 = Some(json::sha256(&self.raw));
         successor(&self.head, &next, &self.raw)?;
         let wanted = encode(&next)?;
+        let product_guard = product_catalog::ProductGuard::acquire(&self.host.context.seed)?;
         let tx = Handle::owned(unsafe {
             CreateTransaction(ptr::null_mut(), ptr::null_mut(), 0, 0, 0, 0, ptr::null())
         })?;
         {
-            let actual = self
-                .store
-                .read_in(&self.host.context.seed, Some(&tx))?
-                .ok_or(Error::SetupIncomplete)?;
+            let actual =
+                time::read_guarded_in(&self.store, &self.host.context.seed, &product_guard, &tx)?
+                    .ok_or(Error::SetupIncomplete)?;
             self.host.authenticate_running(&actual)?;
             let private = self
                 .store

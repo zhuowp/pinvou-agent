@@ -2714,6 +2714,7 @@ class CiGatePolicyTests(unittest.TestCase):
             "pinvou3-app/src-tauri/src/features/runtime_bundle/platform/mod.rs",
             "pinvou3-app/src-tauri/src/features/voice/voice_asr.rs",
             "pinvou3-app/src-tauri/src/features/updater/mod.rs",
+            "pinvou3-app/src-tauri/src/features/updater/host/tests/product-root-history.json",
             "pinvou3-app/src-tauri/src/features/future_feature/mod.rs",
             "pinvou3-app/src-tauri/src/features/assistant/product_runtime/headless_bridge_contract_tests.rs",
         )

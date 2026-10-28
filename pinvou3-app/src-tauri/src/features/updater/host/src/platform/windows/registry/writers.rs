@@ -180,11 +180,11 @@ pub(in crate::platform::windows) fn inspect_journal(
 ) -> Result<crate::WriterJournalStatus> {
     let store = Store::new(&host.context.seed);
     let _guard = BootstrapGuard::acquire(&host.context.seed, false)?;
+    let product_guard = product_catalog::ProductGuard::acquire(&host.context.seed)?;
     let tx = Handle::owned(unsafe {
         CreateTransaction(ptr::null_mut(), ptr::null_mut(), 0, 0, 0, 0, ptr::null())
     })?;
-    let actual = store
-        .read_in(&host.context.seed, Some(&tx))?
+    let actual = time::read_guarded_in(&store, &host.context.seed, &product_guard, &tx)?
         .ok_or(Error::SetupIncomplete)?;
     host.authenticate_running(&actual)?;
     let private = store.key(false, Some(&tx))?.ok_or(Error::SetupIncomplete)?;
@@ -310,11 +310,11 @@ fn retained_reservation_identity(
 /// separately and publish later.
 #[allow(unsafe_code)]
 fn admission_open(store: &Store, host: &StartedServiceContext, expected: &[u8]) -> Result<()> {
+    let product_guard = product_catalog::ProductGuard::acquire(&host.context.seed)?;
     let tx = Handle::owned(unsafe {
         CreateTransaction(ptr::null_mut(), ptr::null_mut(), 0, 0, 0, 0, ptr::null())
     })?;
-    let actual = store
-        .read_in(&host.context.seed, Some(&tx))?
+    let actual = time::read_guarded_in(store, &host.context.seed, &product_guard, &tx)?
         .ok_or(Error::SetupIncomplete)?;
     host.authenticate_running(&actual)?;
     let private = store.key(false, Some(&tx))?.ok_or(Error::SetupIncomplete)?;

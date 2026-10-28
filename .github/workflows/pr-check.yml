@@ -238,6 +238,8 @@ jobs:
               - 'specs/upgrade/v1/**'
             rust_code:
               - 'pinvou3-app/src-tauri/src/features/updater/host/tests/metadata-component-fixture/**'
+              - 'pinvou3-app/src-tauri/src/features/updater/host/tests/metadata-component-history-fixture/**'
+              - 'pinvou3-app/src-tauri/src/features/updater/host/tests/product-root-history.json'
               - 'scripts/metadata-component-fixture.mjs'
               - 'scripts/tests/test_ci_gate_policy.py'
               - 'pinvou3-app/src/shared/i18n/startup-admission.js'
@@ -274,6 +276,8 @@ jobs:
             # to their registration or app command surface still run full tests.
             rust_full:
               - 'pinvou3-app/src/shared/i18n/startup-admission.js'
+              # The signed host history fixture is read by Windows host tests.
+              - 'pinvou3-app/src-tauri/src/features/updater/host/tests/product-root-history.json'
               # Round-1 fix wave (PR #715 review): the loong64 cross-pipeline
               # scripts are build inputs of the rust legs — the pr-check
               # rust-loongarch64-check leg executes the toolchain/sysroot
@@ -2039,6 +2043,20 @@ jobs:
           $output | ForEach-Object { Write-Host $_ }
           if ($code -ne 0 -or @($outputLines | Where-Object { $_ -eq 'PINVOU_METADATA_COMPONENT_TEST_PASSED' }).Count -ne 1) {
             throw 'Protected metadata component test failed or did not run'
+          }
+          # Exercise signed multi-batch replay with a second fixed public lab
+          # anchor using the same isolated component binary and cleanup rules.
+          $dir = Join-Path $env:GITHUB_WORKSPACE 'pinvou3-app/src-tauri/src/features/updater/host/tests/metadata-component-history-fixture'
+          $env:PINVOU_HOST_BOOTSTRAP_SEED = Join-Path $dir 'seed.json'
+          $env:PINVOU_HOST_INITIAL_ROOT = Join-Path $dir 'root.json'
+          if ((Get-FileHash -Algorithm SHA256 -LiteralPath $env:PINVOU_HOST_BOOTSTRAP_SEED).Hash -ne 'EB8B7FE824FB54D33E3A2004D7E11F5A85769308750F34DAD56EB62C62DA5D45' -or
+              (Get-FileHash -Algorithm SHA256 -LiteralPath $env:PINVOU_HOST_INITIAL_ROOT).Hash -ne '9CAAB397724AC6FED0A308B9BE94D375AD01CE590E50EA5A4286836842977C56') { throw 'Unexpected signed-history test fixture' }
+          $output = cargo run --manifest-path pinvou3-app/src-tauri/src/features/updater/host/Cargo.toml --target x86_64-pc-windows-msvc --locked --features metadata-component-tests --bin metadata-component-test 2>&1 | Tee-Object -Variable historyOutputLines
+          $code = $LASTEXITCODE
+          $output | ForEach-Object { Write-Host $_ }
+          if ($code -ne 0 -or @($historyOutputLines | Where-Object { $_ -eq 'PINVOU_METADATA_COMPONENT_TEST_PASSED' }).Count -ne 1 -or
+              @($historyOutputLines | Where-Object { $_ -eq 'PINVOU_SIGNED_ROOT_HISTORY_TEST_PASSED' }).Count -ne 1) {
+            throw 'Signed-history metadata component test failed or did not run'
           }
 
 

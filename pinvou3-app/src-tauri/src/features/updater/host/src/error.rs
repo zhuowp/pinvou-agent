@@ -30,6 +30,7 @@ pub enum Error {
     RestartConflict,
     StagingCanceled,
     InspectionCanceled,
+    TimeCanceled,
 }
 impl Error {
     pub(crate) fn from_code(code: &str) -> Option<Self> {
@@ -63,6 +64,7 @@ impl Error {
             Error::RestartConflict,
             Error::StagingCanceled,
             Error::InspectionCanceled,
+            Error::TimeCanceled,
         ];
         ALL.iter().copied().find(|error| error.code() == code)
     }
@@ -97,6 +99,7 @@ impl Error {
             Self::RestartConflict => "HOST_RESTART_CONFLICT",
             Self::StagingCanceled => "HOST_BYTE_STAGING_CANCELED",
             Self::InspectionCanceled => "HOST_INSTALLED_IMAGE_INSPECTION_CANCELED",
+            Self::TimeCanceled => "HOST_TIME_CANCELED",
         }
     }
 }

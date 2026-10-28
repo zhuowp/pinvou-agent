@@ -6,7 +6,7 @@ use super::{
     registry::{
         BootstrapGuard, Store,
         product_catalog::ProductGuard,
-        time::{PolicySnapshot, TimeSnapshot},
+        time::{PolicySnapshot, RootScratch, TimeSnapshot},
     },
     time_transport::TimeTransport,
 };
@@ -17,7 +17,10 @@ use crate::{
 };
 use pinvou_upgrade_codec::{Document, InputKind};
 use pinvou_upgrade_control_http::RootGetResult;
-use pinvou_upgrade_verifier::{SuppliedTimeObservation, verify_time_response_source};
+use pinvou_upgrade_verifier::{
+    SuppliedTimeObservation, TimeVerificationError, verify_time_response_source,
+    verify_time_root_successor,
+};
 
 pub(super) struct TimeOwner {
     snapshot: TimeSnapshot,
@@ -39,6 +42,14 @@ impl TimeOwner {
             return Err(Error::StateCorrupt);
         }
         let incarnation = Incarnation::from_host(&before)?;
+        if snapshot.state.product_root.is_none()
+            && snapshot.state.roots.is_empty()
+            && snapshot.state.floor.is_none()
+            && snapshot.state.evidence.is_none()
+            && let Some(caught_up) = store.time_catchup_new(host, &snapshot)?
+        {
+            snapshot = caught_up;
+        }
         if snapshot.state.incarnation.as_ref() != Some(&incarnation) {
             // Invalidate continuity durably BEFORE any network/policy work.
             // Original floor, Root lineage, evidence and barrier all survive.
@@ -98,7 +109,13 @@ impl TimeOwner {
         if actual.raw != self.snapshot.raw || actual.original_root != self.snapshot.original_root {
             return Err(Error::ScopeConflict);
         }
-        if self.snapshot.state.status != Status::Unknown {
+        // A lagging compact member first persists a product-position cursor
+        // without changing its signed evidence or cleanup state. Its stale
+        // time cannot be consumed at the newer product Root.
+        self.commit_uncertain = true;
+        let caught_up = store.time_catchup_existing(host, &self.snapshot)?;
+        self.commit_uncertain = false;
+        if self.snapshot.state.status != Status::Unknown && !caught_up {
             let next = self
                 .snapshot
                 .state
@@ -107,9 +124,9 @@ impl TimeOwner {
             self.snapshot = store.time_commit(host, &self.snapshot, &next, None)?;
             self.commit_uncertain = false;
         }
-        // First durably invalidate the previous observation, then refuse to
-        // use this Root until the protected product census permits it.
-        store.time_acquisition_preflight(host, &self.snapshot)?;
+        // The prior observation is either durably invalidated or cannot be
+        // consumed because it is behind the authenticated product Root.
+        let mut anchor = store.time_acquisition_preflight(host, &self.snapshot, None)?;
         // Policy missing is a safe fixed error, not a default profile. Capture
         // bytes are finally re-read by time_commit in its actual native TX.
         let policy = store.time_policy(seed, &self.snapshot)?;
@@ -131,25 +148,36 @@ impl TimeOwner {
             self.commit_uncertain = true;
             self.snapshot = store.time_commit(host, &self.snapshot, &unknown, Some(&policy))?;
             self.commit_uncertain = false;
+            // The updated state has a new digest; refresh any catch-up cursor
+            // and reacquire the product anchor before starting network work.
+            if caught_up || self.snapshot.state.product_root.is_some() {
+                self.commit_uncertain = true;
+                let _ = store.time_catchup_existing(host, &self.snapshot)?;
+                self.commit_uncertain = false;
+            }
+            anchor = store.time_acquisition_preflight(host, &self.snapshot, None)?;
         }
+        let trusted_root = anchor.root;
         let floor = self
             .snapshot
             .state
             .floor
             .unwrap_or(0)
             .max(store.budget_time_floor(seed, &current)?.unwrap_or(0));
-        let base_root_count = self.snapshot.state.roots.len();
-        let trusted_root = self
-            .snapshot
-            .state
-            .current_root(&self.snapshot.original_root)
-            .to_vec();
-        let mut roots = self.snapshot.state.roots.clone();
-        root_capacity(&roots)?;
+        let base_root_count = anchor.root_count;
+        let history_latest_issue = anchor.latest_issue;
+        // Keep the network attempt relative to the authenticated product anchor.
+        // The member's retained lineage is used only when publishing the legacy
+        // state; it must not independently choose the request's trust anchor.
+        let mut successors = store.time_root_scratch(host, &self.snapshot)?;
         loop {
-            let selected = roots
-                .last()
-                .map_or(self.snapshot.original_root.as_slice(), |s| s.as_bytes());
+            successors.verify_all()?;
+            let selected_owned = if successors.len() == 0 {
+                None
+            } else {
+                Some(successors.read(successors.len() - 1)?)
+            };
+            let selected = selected_owned.as_deref().unwrap_or(trusted_root.as_slice());
             let version = root_version(selected, &self.snapshot.state.binding.product)?;
             let nonce = transport.fresh_nonce()?;
             let request = json::encode(
@@ -167,7 +195,6 @@ impl TimeOwner {
             if let Ok(response) = response {
                 let received = host.sample_monotonic()?;
                 received.elapsed_since(&sent)?;
-                let successors = &roots[base_root_count..];
                 let observation = SuppliedTimeObservation {
                     sent_monotonic_millis: sent.counters().suspend_inclusive().floor_millis()?,
                     received_monotonic_millis: received
@@ -178,26 +205,36 @@ impl TimeOwner {
                     max_uncertainty_millis: policy.policy.max_uncertainty_ms,
                     trusted_time_floor_millis: floor,
                 };
-                if verify_time_response_source(
+                let mut source_error = None;
+                let verified = verify_time_response_source(
                     &response,
                     &trusted_root,
                     successors.len(),
-                    |index| Ok(std::borrow::Cow::Borrowed(successors[index].as_bytes())),
+                    |index| read_time_source(|| successors.read(index), &mut source_error),
                     &request_shape,
                     observation,
                     &denied,
-                )
-                .is_ok()
-                {
+                );
+                if let Some(error) = source_error {
+                    return Err(error);
+                }
+                if verified.as_ref().is_ok_and(|time| {
+                    crate::trusted_time::check_history_time_bound(
+                        history_latest_issue,
+                        time.earliest_millis(),
+                    )
+                    .is_ok()
+                }) {
                     // Include the first actual signature verification in the
                     // receive/verification bracket, retaining original send.
                     let verified_at = host.sample_monotonic()?;
                     verified_at.elapsed_since(&sent)?;
+                    let mut source_error = None;
                     let checked = verify_time_response_source(
                         &response,
                         &trusted_root,
                         successors.len(),
-                        |index| Ok(std::borrow::Cow::Borrowed(successors[index].as_bytes())),
+                        |index| read_time_source(|| successors.read(index), &mut source_error),
                         &request_shape,
                         SuppliedTimeObservation {
                             received_monotonic_millis: verified_at
@@ -207,6 +244,14 @@ impl TimeOwner {
                             ..observation
                         },
                         &denied,
+                    );
+                    if let Some(error) = source_error {
+                        return Err(error);
+                    }
+                    let checked = checked.map_err(|_| Error::SourceUnavailable)?;
+                    crate::trusted_time::check_history_time_bound(
+                        history_latest_issue,
+                        checked.earliest_millis(),
                     )
                     .map_err(|_| Error::SourceUnavailable)?;
                     let evidence = Evidence {
@@ -224,7 +269,7 @@ impl TimeOwner {
                         earliest: checked.earliest_millis(),
                         latest: checked.latest_millis(),
                     };
-                    return self.publish(host, &store, policy, roots, denied, evidence);
+                    return self.publish(host, &store, policy, &successors, denied, evidence);
                 }
             }
             // A missing successor is only a failed acquisition attempt, never
@@ -233,9 +278,6 @@ impl TimeOwner {
                 .checked_add(1)
                 .filter(|n| *n <= json::SAFE_MAX)
                 .ok_or(Error::Unavailable)?;
-            if roots.len() >= 4096 {
-                return Err(Error::Unavailable);
-            }
             match transport
                 .get_root(&self.snapshot.state.binding.product, next_version)
                 .await?
@@ -247,17 +289,27 @@ impl TimeOwner {
                     {
                         return Err(Error::SourceUnavailable);
                     }
-                    // Check cumulative retained bytes BEFORE copying another
-                    // original. The HTTP adapter already bounds a single Root.
-                    let total = root_capacity(&roots)?
-                        .checked_add(root.bytes().len())
-                        .filter(|n| *n <= json::RECORD_MAX)
-                        .ok_or(Error::Unavailable)?;
-                    let _ = total;
-                    roots.push(
-                        String::from_utf8(root.bytes().to_vec())
-                            .map_err(|_| Error::SourceUnavailable)?,
-                    );
+                    // Authenticate both Root thresholds before this object can
+                    // become the anchor of another network time request.
+                    verify_time_root_successor(
+                        selected,
+                        root.bytes(),
+                        &self.snapshot.state.binding.product,
+                        &denied,
+                    )
+                    .map_err(|_| Error::SourceUnavailable)?;
+                    let transition = store.time_acquisition_preflight(
+                        host,
+                        &self.snapshot,
+                        Some((&successors, root.bytes())),
+                    )?;
+                    if transition.root != trusted_root
+                        || transition.root_count != base_root_count
+                        || transition.latest_issue != history_latest_issue
+                    {
+                        return Err(Error::ScopeConflict);
+                    }
+                    successors.push(root.bytes())?;
                 }
             }
         }
@@ -267,7 +319,7 @@ impl TimeOwner {
         host: &StartedServiceContext,
         store: &Store,
         policy: PolicySnapshot,
-        roots: Vec<String>,
+        successors: &RootScratch,
         denied: Vec<String>,
         evidence: Evidence,
     ) -> Result<()> {
@@ -286,14 +338,29 @@ impl TimeOwner {
         next.cleanup_pending = true;
         next.zero_retention = None;
         next.floor = Some(evidence.earliest);
-        next.roots = roots;
         next.denied_key_ids = denied;
         next.evidence = Some(evidence);
-        next.validate(&self.snapshot.original_root)?;
         // Refuse every further refresh after an ambiguous/erroring publisher.
         // Reopening authenticates actual committed state; it never resets it.
         self.commit_uncertain = true;
-        self.snapshot = store.time_commit(host, &self.snapshot, &next, Some(&policy))?;
+        self.snapshot = if self.snapshot.state.product_root.is_some()
+            || next
+                .evidence
+                .as_ref()
+                .is_some_and(|e| e.base_root_count > 0)
+            || successors.len() != 0
+        {
+            store.time_commit_compact_anchor(
+                host,
+                &self.snapshot,
+                &policy,
+                next.evidence.as_ref().ok_or(Error::StateCorrupt)?,
+                successors,
+            )?
+        } else {
+            next.validate(&self.snapshot.original_root)?;
+            store.time_commit(host, &self.snapshot, &next, Some(&policy))?
+        };
         self.commit_uncertain = false;
         // The fixed cleanup-only native operation may finish a genuine fresh
         // zero-obligation census. Legacy/nonzero custody cannot be guessed empty.
@@ -317,20 +384,62 @@ impl TimeOwner {
         Ok(())
     }
 }
-fn root_capacity(roots: &[String]) -> Result<usize> {
-    if roots.len() > 4096 {
-        return Err(Error::Unavailable);
-    }
-    roots.iter().try_fold(0usize, |total, root| {
-        total
-            .checked_add(root.len())
-            .filter(|n| *n <= json::RECORD_MAX)
-            .ok_or(Error::Unavailable)
+fn read_time_source(
+    read: impl FnOnce() -> Result<Vec<u8>>,
+    source_error: &mut Option<Error>,
+) -> std::result::Result<std::borrow::Cow<'static, [u8]>, TimeVerificationError> {
+    read().map(std::borrow::Cow::Owned).map_err(|error| {
+        *source_error = Some(error);
+        TimeVerificationError::InvalidObservation
     })
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn both_verification_reads_preserve_source_failure_for_owner() {
+        for error in [
+            Error::SourceUnavailable,
+            Error::Busy,
+            Error::StagingCanceled,
+            Error::TimeCanceled,
+        ] {
+            for _phase in 0..2 {
+                let mut observed = None;
+                assert!(read_time_source(|| Err(error), &mut observed).is_err());
+                assert_eq!(observed, Some(error));
+            }
+        }
+    }
+    #[test]
+    fn successor_preflight_checks_real_dual_thresholds_and_denials() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/product-root-history.json"
+        )))
+        .unwrap();
+        let original = fixture["original"].as_str().unwrap().as_bytes();
+        let successor = fixture["batches"][0]["successors"][0].as_str().unwrap();
+        assert!(verify_time_root_successor(original, successor.as_bytes(), "pinvou", &[]).is_ok());
+        let mut damaged: serde_json::Value = serde_json::from_str(successor).unwrap();
+        let signature = damaged["signatures"][0]["signature"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let first = if signature.starts_with('A') { 'B' } else { 'A' };
+        damaged["signatures"][0]["signature"] = format!("{}{}", first, &signature[1..]).into();
+        let damaged = json::encode(&damaged, false).unwrap();
+        assert!(verify_time_root_successor(original, &damaged, "pinvou", &[]).is_err());
+        let denied = serde_json::from_str::<serde_json::Value>(successor).unwrap()["signatures"][0]
+            ["keyId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            verify_time_root_successor(original, successor.as_bytes(), "pinvou", &[denied])
+                .is_err()
+        );
+    }
     #[test]
     #[allow(unsafe_code)]
     fn native_mutex_recursion_keeps_other_threads_excluded_until_final_release() {
@@ -377,14 +486,5 @@ mod tests {
         assert_eq!(observe(), WAIT_TIMEOUT);
         assert_ne!(unsafe { ReleaseMutex(mutex.0) }, 0);
         assert_eq!(observe(), WAIT_OBJECT_0);
-    }
-    #[test]
-    fn successor_capacity_is_checked_before_retaining_more_originals() {
-        let full = vec!["x".repeat(json::RECORD_MAX)];
-        assert_eq!(root_capacity(&full).unwrap(), json::RECORD_MAX);
-        let mut excessive = full;
-        excessive.push("x".into());
-        assert!(root_capacity(&excessive).is_err());
-        assert!(root_capacity(&vec![String::new(); 4097]).is_err());
     }
 }

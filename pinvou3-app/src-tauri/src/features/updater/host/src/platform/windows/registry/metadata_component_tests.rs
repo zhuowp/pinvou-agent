@@ -164,7 +164,26 @@ pub(crate) fn run_isolated() {
     Store::new(&seed)
         .verify_initial_metadata(&seed, &reopened)
         .expect("recheck original initial intent");
+    historical_genesis_uses_transacted_registry(&store, &seed, &reopened);
+    waterlog_structure_uses_transacted_registry(&store, &seed, &reopened);
+    if seed.original_root.sha256
+        == "9caab397724ac6fed0a308b9be94d375ad01ce590e50ea5a4286836842977c56"
+    {
+        historical_legacy_uses_signed_transacted_records(&store, &seed, &reopened);
+        signed_history_replays_from_transacted_objects(&store, &seed, &reopened);
+    }
+    root_read_set_rechecks_and_discards_mutations(&store, &seed, &reopened);
+    root_snapshot_partial_write_rolls_back(&store, &seed, &reopened);
+    root_evidence_codec_rolls_back(&store, &seed, &reopened);
     root_transition_requires_exact_empty_layout(&store, &seed, &reopened);
+    let private = store.key(false, None).unwrap().unwrap();
+    assert!(
+        open(private.0, "root-snapshot-test", false, None)
+            .unwrap()
+            .is_none(),
+        "rejected snapshot transaction must not persist partial objects"
+    );
+    drop(private);
     catalog_damage_refuses_profile_read(&store, &seed, &reopened);
     catalog_other_product_damage_is_isolated(&seed, &reopened);
     assert_eq!(
@@ -198,7 +217,239 @@ pub(crate) fn run_isolated() {
     normal
         .verify_initial_metadata(&seed, &committed)
         .expect("normal initial state remains valid");
+    product_lock_contention(&seed);
+    missing_top_level_catalog_refuses_initialized_profile(&normal, &seed);
     _normal_root.finish();
+}
+
+#[allow(unsafe_code)]
+fn waterlog_structure_uses_transacted_registry(
+    store: &Store,
+    seed: &Seed,
+    host: &HostRegistration,
+) {
+    let _profile = BootstrapGuard::acquire(seed, false).unwrap();
+    let _product = product_catalog::ProductGuard::acquire(seed).unwrap();
+    let tx = Handle::owned(unsafe {
+        CreateTransaction(ptr::null_mut(), ptr::null_mut(), 0, 0, 0, 0, ptr::null())
+    })
+    .unwrap();
+    let private = store.key(true, Some(&tx)).unwrap().unwrap();
+    metadata::component_test_waterlog_structure_in(&private, seed, host, &tx).unwrap();
+}
+
+#[allow(unsafe_code)]
+fn historical_legacy_uses_signed_transacted_records(
+    store: &Store,
+    seed: &Seed,
+    host: &HostRegistration,
+) {
+    let _profile = BootstrapGuard::acquire(seed, false).unwrap();
+    let product = product_catalog::ProductGuard::acquire(seed).unwrap();
+    let tx = Handle::owned(unsafe {
+        CreateTransaction(ptr::null_mut(), ptr::null_mut(), 0, 0, 0, 0, ptr::null())
+    })
+    .unwrap();
+    let private = store.key(true, Some(&tx)).unwrap().unwrap();
+    super::time::component_test_historical_legacy(&private, seed, host, &product, &tx).unwrap();
+}
+
+#[allow(unsafe_code)]
+fn historical_genesis_uses_transacted_registry(
+    store: &Store,
+    seed: &Seed,
+    host: &HostRegistration,
+) {
+    let _profile = BootstrapGuard::acquire(seed, false).unwrap();
+    let product = product_catalog::ProductGuard::acquire(seed).unwrap();
+    let tx = Handle::owned(unsafe {
+        CreateTransaction(ptr::null_mut(), ptr::null_mut(), 0, 0, 0, 0, ptr::null())
+    })
+    .unwrap();
+    let private = store.key(false, Some(&tx)).unwrap().unwrap();
+    let source = super::time::current_in(&private, seed, host, &product, &tx).unwrap();
+    super::time::component_test_historical_genesis(&source).unwrap();
+    // Dropping the uncommitted transaction removes all damaged/extra rows.
+}
+
+fn product_lock_contention(seed: &Seed) {
+    let guard = product_catalog::ProductGuard::acquire(seed).expect("acquire product lock");
+    std::thread::scope(|scope| {
+        let contender = scope.spawn(|| {
+            matches!(
+                product_catalog::ProductGuard::acquire(seed),
+                Err(Error::Busy)
+            )
+        });
+        assert!(contender.join().unwrap(), "other thread must observe Busy");
+    });
+    drop(guard);
+    let _again = product_catalog::ProductGuard::acquire(seed).expect("released lock is available");
+}
+
+/// Delete only the catalog in this test's private HKLM override, after the
+/// initialized profile has been verified. The isolated root is then removed.
+#[allow(unsafe_code)]
+fn missing_top_level_catalog_refuses_initialized_profile(store: &Store, seed: &Seed) {
+    assert!(store.read(seed).unwrap().is_some());
+    let pinvou = open(HKEY_LOCAL_MACHINE, "Software\\Pinvou", true, None)
+        .unwrap()
+        .unwrap();
+    let leaf = if seed.profile_kind == "production" {
+        "UpgradeProductCatalogV1"
+    } else {
+        "UpgradeProductCatalogLabV1"
+    };
+    assert_eq!(unsafe { RegDeleteTreeW(pinvou.0, wide(leaf).as_ptr()) }, 0);
+    if open(pinvou.0, leaf, false, None).unwrap().is_some() {
+        assert_eq!(
+            unsafe {
+                windows_sys::Win32::System::Registry::RegDeleteKeyW(pinvou.0, wide(leaf).as_ptr())
+            },
+            0
+        );
+    }
+    assert!(open(pinvou.0, leaf, false, None).unwrap().is_none());
+    assert!(matches!(store.read(seed), Err(Error::StateCorrupt)));
+}
+
+/// Exercises actual TxR object reads and protected member snapshots with public
+/// signed fixture data. This does not construct an SCM service, commit a Root
+/// Head, or prove production history publication/recovery.
+#[allow(unsafe_code)]
+fn signed_history_replays_from_transacted_objects(
+    store: &Store,
+    seed: &Seed,
+    host: &HostRegistration,
+) {
+    use crate::{
+        identity::ProcessSelector,
+        monotonic::CounterObservation,
+        trusted_time::{
+            Binding, CounterEvidence, Evidence, Incarnation, ProductRootBatch, ProductRootReplay,
+        },
+    };
+    let fixture: serde_json::Value = serde_json::from_slice(include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/product-root-history.json"
+    )))
+    .unwrap();
+    assert_eq!(
+        fixture["original"].as_str().unwrap().as_bytes(),
+        seed.original_root_bytes()
+    );
+    {
+        let _profile = BootstrapGuard::acquire(seed, false).unwrap();
+        let _product = product_catalog::ProductGuard::acquire(seed).unwrap();
+        let tx = Handle::owned(unsafe {
+            CreateTransaction(ptr::null_mut(), ptr::null_mut(), 0, 0, 0, 0, ptr::null())
+        })
+        .unwrap();
+        let private = store.key(true, Some(&tx)).unwrap().unwrap();
+        let scratch = create(private.0, "signed-root-history-test", &tx, false, true).unwrap();
+        let members = create(scratch.0, "members", &tx, false, true).unwrap();
+        let objects = create(scratch.0, "roots", &tx, false, true).unwrap();
+        let mut member_records = Vec::new();
+        product_catalog::visit_members_in(seed, host, &tx, |event, actual| {
+            let name = format!("{:020}", member_records.len() + 1);
+            let raw =
+                super::time::root_snapshot::capture_in(&members, &name, seed, event, actual, &tx)?;
+            member_records.push((name, raw));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(member_records.len(), 1, "fixture installs one real member");
+        let time = open(private.0, "trusted-time-v1", false, Some(&tx))
+            .unwrap()
+            .unwrap();
+        let policy = String::from_utf8(read(&time, "Policy").unwrap()).unwrap();
+        let binding = Binding::from_host(host);
+        let sent = CounterEvidence::from_data(
+            CounterObservation::from_bracket(10_000_000, 9_000_000, 9_000_000, 10_000_000).unwrap(),
+        );
+        let received = CounterEvidence::from_data(
+            CounterObservation::from_bracket(10_200_000, 9_200_000, 9_200_000, 10_200_000).unwrap(),
+        );
+        let incarnation = Incarnation {
+            host_epoch: 1,
+            instance_nonce: "c".repeat(64),
+            process: ProcessSelector {
+                process_id: 3,
+                creation_file_time: FileTime::from_native(1, 2),
+            },
+        };
+        let entries = fixture["batches"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        let mut batches = Vec::new();
+        for (batch_index, entry) in entries.iter().enumerate() {
+            let roots = entry["successors"].as_array().unwrap();
+            for (root_index, root) in roots.iter().enumerate() {
+                let name = format!("{batch_index}-{root_index}");
+                write(&objects, &name, root.as_str().unwrap().as_bytes()).unwrap();
+            }
+            batches.push(ProductRootBatch {
+                binding: binding.clone(),
+                successor_count: roots.len(),
+                evidence: Evidence {
+                    incarnation: incarnation.clone(),
+                    request: serde_json::to_string(&entry["request"]).unwrap(),
+                    response: entry["response"].as_str().unwrap().into(),
+                    sent: sent.clone(),
+                    received: received.clone(),
+                    policy: policy.clone(),
+                    floor_before: 0,
+                    base_root_count: if batch_index == 0 { 0 } else { 2 },
+                    denied_key_ids: Vec::new(),
+                    earliest: entry["earliest"].as_u64().unwrap(),
+                    latest: entry["latest"].as_u64().unwrap(),
+                },
+            });
+        }
+        let mut cursor =
+            ProductRootReplay::new(&seed.product, fixture["original"].as_str().unwrap()).unwrap();
+        let advance = |cursor: &mut ProductRootReplay, index: usize| {
+            cursor.advance(
+                &batches[index],
+                |root_index| read(&objects, &format!("{index}-{root_index}")),
+                |visit| {
+                    for (name, raw) in &member_records {
+                        let key =
+                            open(members.0, name, false, Some(&tx))?.ok_or(Error::StateCorrupt)?;
+                        super::time::root_snapshot::read_in(&key, &tx, raw)?.visit(visit)?;
+                    }
+                    Ok(())
+                },
+            )
+        };
+        advance(&mut cursor, 0).expect("first signed batch from TxR");
+        let name = "1-0";
+        let original = read(&objects, name).unwrap();
+        write(&objects, name, b"replaced").unwrap();
+        assert!(
+            advance(&mut cursor, 1).is_err(),
+            "replacement refuses replay"
+        );
+        write(&objects, name, &original).unwrap();
+        assert_eq!(
+            unsafe { RegDeleteValueW(objects.0, wide(name).as_ptr()) },
+            0
+        );
+        assert!(
+            advance(&mut cursor, 1).is_err(),
+            "missing Root refuses replay"
+        );
+        write(&objects, name, &original).unwrap();
+        advance(&mut cursor, 1).expect("second signed batch after failed reads");
+        cursor.finish(2, 3, &json::sha256(&original)).unwrap();
+    }
+    let private = store.key(false, None).unwrap().unwrap();
+    assert!(
+        open(private.0, "signed-root-history-test", false, None)
+            .unwrap()
+            .is_none(),
+        "all fixture data must roll back with the test transaction"
+    );
+    println!("PINVOU_SIGNED_ROOT_HISTORY_TEST_PASSED");
 }
 
 // The shared event chain remains intact while the other product's private
@@ -373,6 +624,136 @@ fn catalog_damage_refuses_profile_read(store: &Store, seed: &Seed, host: &HostRe
 /// Exercise the real transacted registry namespace without installing or
 /// starting a service. Dropping this test transaction rolls back its mutations.
 #[allow(unsafe_code)]
+fn root_read_set_rechecks_and_discards_mutations(
+    store: &Store,
+    seed: &Seed,
+    host: &HostRegistration,
+) {
+    let mut wrong = host.clone();
+    wrong.profile_id = "other-profile".into();
+    assert!(super::time::RootReadSet::new(seed, &wrong).is_err());
+    {
+        let source = super::time::RootReadSet::new(seed, host).expect("read protected inputs");
+        source.recheck().expect("stable protected inputs");
+        source.damage_time_head_for_test().unwrap();
+        assert!(source.recheck().is_err());
+    }
+    assert!(store.read(seed).unwrap().is_some());
+    {
+        let source = super::time::RootReadSet::new(seed, host).expect("read protected inputs");
+        source.stage_container_for_test().unwrap();
+        source
+            .recheck()
+            .expect("scratch container preserves product validation");
+        source.change_valid_policy_for_test().unwrap();
+        assert_eq!(source.recheck(), Err(Error::ScopeConflict));
+    }
+    {
+        let source = super::time::RootReadSet::new(seed, host).expect("read protected inputs");
+        source.stage_container_for_test().unwrap();
+        source.damage_original_root_for_test().unwrap();
+        assert!(source.recheck().is_err());
+    }
+    {
+        let source = super::time::RootReadSet::new(seed, host).expect("read protected inputs");
+        source.stage_container_for_test().unwrap();
+        source.delete_policy_for_test().unwrap();
+        assert!(source.recheck().is_err());
+    }
+    {
+        let source = super::time::RootReadSet::new(seed, host).expect("read protected inputs");
+        source.stage_container_for_test().unwrap();
+        source.add_root_extra_for_test().unwrap();
+        assert!(source.recheck().is_err());
+    }
+    {
+        let source = super::time::RootReadSet::new(seed, host).expect("rollback retained inputs");
+        source.damage_policy_for_test().unwrap();
+        assert!(source.recheck().is_err());
+    }
+    {
+        let source = super::time::RootReadSet::new(seed, host).expect("rollback retained policy");
+        source.empty_policy_for_test().unwrap();
+        assert!(source.recheck().is_err());
+    }
+    assert!(super::time::RootReadSet::new(seed, host).is_ok());
+    let source = super::time::RootReadSet::new(seed, host).expect("read protected inputs");
+    assert_eq!(
+        source.probe_first_root_batch(),
+        Err(Error::PrerequisiteUnavailable)
+    );
+    let leaf = if seed.profile_kind == "production" {
+        "UpgradeProductCatalogV1"
+    } else {
+        "UpgradeProductCatalogLabV1"
+    };
+    let path = format!(
+        "Software\\Pinvou\\{leaf}\\products\\{}\\root-state-v1",
+        json::sha256(seed.product.as_bytes())
+    );
+    let root = open(HKEY_LOCAL_MACHINE, &path, false, None)
+        .unwrap()
+        .unwrap();
+    assert!(open(root.0, "candidate-v2", false, None).unwrap().is_none());
+    let private = store.key(false, None).unwrap().unwrap();
+    assert!(
+        open(private.0, "root-history-candidate-v2", false, None)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[allow(unsafe_code)]
+fn root_evidence_codec_rolls_back(store: &Store, seed: &Seed, host: &HostRegistration) {
+    {
+        let _guard = product_catalog::ProductGuard::acquire(seed).unwrap();
+        let tx = Handle::owned(unsafe {
+            CreateTransaction(ptr::null_mut(), ptr::null_mut(), 0, 0, 0, 0, ptr::null())
+        })
+        .unwrap();
+        let private = store.key(true, Some(&tx)).unwrap().unwrap();
+        super::time::root_history::component_test(&private, host, &tx).unwrap();
+    }
+    let private = store.key(false, None).unwrap().unwrap();
+    for name in ["root-evidence-test", "root-evidence-partial-test"] {
+        assert!(open(private.0, name, false, None).unwrap().is_none());
+    }
+}
+
+#[allow(unsafe_code)]
+fn root_snapshot_partial_write_rolls_back(store: &Store, seed: &Seed, host: &HostRegistration) {
+    {
+        let _guard = product_catalog::ProductGuard::acquire(seed).unwrap();
+        let tx = Handle::owned(unsafe {
+            CreateTransaction(ptr::null_mut(), ptr::null_mut(), 0, 0, 0, 0, ptr::null())
+        })
+        .unwrap();
+        let private = store.key(true, Some(&tx)).unwrap().unwrap();
+        let snapshots = create(private.0, "root-snapshot-partial-test", &tx, false, true).unwrap();
+        let result = product_catalog::visit_members_in(seed, host, &tx, |event, actual| {
+            super::time::root_snapshot::FAIL_AFTER_ENROLLMENT.store(true, Ordering::SeqCst);
+            let result = super::time::root_snapshot::capture_in(
+                &snapshots, "partial", seed, event, actual, &tx,
+            );
+            assert!(matches!(result, Err(Error::Unavailable)));
+            let partial =
+                open(snapshots.0, "partial", false, Some(&tx))?.ok_or(Error::StateCorrupt)?;
+            assert!(!read(&partial, "Enrollment")?.is_empty());
+            assert!(read(&partial, "Record").is_err());
+            Err(Error::Unavailable)
+        });
+        assert_eq!(result, Err(Error::Unavailable));
+        // Drop all keys, then the uncommitted transaction, while the guard is held.
+    }
+    let private = store.key(false, None).unwrap().unwrap();
+    assert!(
+        open(private.0, "root-snapshot-partial-test", false, None)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[allow(unsafe_code)]
 fn root_transition_requires_exact_empty_layout(
     store: &Store,
     seed: &Seed,
@@ -416,6 +797,125 @@ fn root_transition_requires_exact_empty_layout(
     let metadata = open(private.0, "metadata-state-v1", true, Some(&tx))
         .unwrap()
         .unwrap();
+    let original_policy = read(&metadata, "Policy").unwrap();
+    assert_eq!(
+        unsafe { RegDeleteValueW(metadata.0, wide("Policy").as_ptr()) },
+        0
+    );
+    assert_eq!(check_members(), Err(Error::StateCorrupt));
+    assert_eq!(
+        super::metadata::check_in(&private, seed, host, Some(&tx)),
+        Err(Error::StateCorrupt)
+    );
+    write(&metadata, "Policy", b"{}").unwrap();
+    assert_eq!(check_members(), Err(Error::StateCorrupt));
+    write(&metadata, "Policy", &original_policy).unwrap();
+    check_members().expect("restored explicit metadata role policy is accepted");
+    let waterlog = open(metadata.0, "waterlog", true, Some(&tx))
+        .unwrap()
+        .unwrap();
+    let water_head = read(&waterlog, "Head").unwrap();
+    let water_genesis = read(&waterlog, "Genesis").unwrap();
+    assert_eq!(
+        unsafe { RegDeleteValueW(waterlog.0, wide("Genesis").as_ptr()) },
+        0
+    );
+    assert_eq!(
+        super::metadata::check_in(&private, seed, host, Some(&tx)),
+        Err(Error::StateCorrupt)
+    );
+    assert!(
+        read(&waterlog, "Genesis").is_err(),
+        "read must not recreate missing genesis"
+    );
+    write(&waterlog, "Genesis", &water_genesis).unwrap();
+    write(&waterlog, "Genesis", b"wrong-binding").unwrap();
+    assert_eq!(check_members(), Err(Error::StateCorrupt));
+    write(&waterlog, "Genesis", &water_genesis).unwrap();
+    write(&waterlog, "Head", b"damaged").unwrap();
+    assert_eq!(check_members(), Err(Error::StateCorrupt));
+    write(&waterlog, "Head", &water_head).unwrap();
+    let entries = open(waterlog.0, "entries", true, Some(&tx))
+        .unwrap()
+        .unwrap();
+    write(&entries, "Unexpected", b"x").unwrap();
+    assert!(check_members().is_err());
+    assert_eq!(
+        unsafe { RegDeleteValueW(entries.0, wide("Unexpected").as_ptr()) },
+        0
+    );
+    write(&entries, "", b"unexpected-default").unwrap();
+    assert_eq!(check_members(), Err(Error::StateCorrupt));
+    assert_eq!(unsafe { RegDeleteValueW(entries.0, wide("").as_ptr()) }, 0);
+    let extra = create(entries.0, "unexpected", &tx, false, true).unwrap();
+    assert_eq!(check_members(), Err(Error::StateCorrupt));
+    drop(extra);
+    assert_eq!(
+        unsafe {
+            RegDeleteKeyTransactedW(
+                entries.0,
+                wide("unexpected").as_ptr(),
+                KEY_WOW64_64KEY,
+                0,
+                tx.raw(),
+                ptr::null(),
+            )
+        },
+        0
+    );
+    drop(entries);
+    assert_eq!(
+        unsafe {
+            RegDeleteKeyTransactedW(
+                waterlog.0,
+                wide("entries").as_ptr(),
+                KEY_WOW64_64KEY,
+                0,
+                tx.raw(),
+                ptr::null(),
+            )
+        },
+        0
+    );
+    assert_eq!(
+        super::metadata::check_in(&private, seed, host, Some(&tx)),
+        Err(Error::StateCorrupt)
+    );
+    assert!(
+        open(waterlog.0, "entries", false, Some(&tx))
+            .unwrap()
+            .is_none()
+    );
+    drop(waterlog);
+    assert_eq!(
+        unsafe {
+            RegDeleteKeyTransactedW(
+                metadata.0,
+                wide("waterlog").as_ptr(),
+                KEY_WOW64_64KEY,
+                0,
+                tx.raw(),
+                ptr::null(),
+            )
+        },
+        0
+    );
+    assert_eq!(
+        super::metadata::check_in(&private, seed, host, Some(&tx)),
+        Err(Error::StateCorrupt)
+    );
+    assert!(
+        open(metadata.0, "waterlog", false, Some(&tx))
+            .unwrap()
+            .is_none()
+    );
+    let waterlog = create(metadata.0, "waterlog", &tx, false, true).unwrap();
+    let entries = create(waterlog.0, "entries", &tx, false, true).unwrap();
+    write(&waterlog, "Genesis", &water_genesis).unwrap();
+    write(&waterlog, "Head", &water_head).unwrap();
+    drop(entries);
+    drop(waterlog);
+    check_members().expect("restored empty waterlog is accepted");
     let original_head = read(&metadata, "Head").unwrap();
     write(&metadata, "Head", b"unknown-new-head").unwrap();
     assert_eq!(
@@ -435,6 +935,46 @@ fn root_transition_requires_exact_empty_layout(
     super::metadata::require_empty_for_root_transition_in(&private, seed, host, &tx)
         .expect("restoring exact empty layout permits Root transition");
     check_members().expect("restored member genesis is accepted");
+    let snapshots = create(private.0, "root-snapshot-test", &tx, false, true).unwrap();
+    let mut count = 0u64;
+    product_catalog::visit_members_in(seed, host, &tx, |event, actual| {
+        let name = revision_name(count + 1);
+        let mut wrong_host = actual.clone();
+        wrong_host.profile_id = "other-profile".into();
+        assert!(
+            super::time::root_snapshot::capture_in(
+                &snapshots,
+                "wrong-host",
+                seed,
+                event,
+                &wrong_host,
+                &tx,
+            )
+            .is_err()
+        );
+        assert!(open(snapshots.0, "wrong-host", false, Some(&tx))?.is_none());
+        let raw =
+            super::time::root_snapshot::capture_in(&snapshots, &name, seed, event, actual, &tx)?;
+        let member = open(snapshots.0, &name, true, Some(&tx))?.ok_or(Error::StateCorrupt)?;
+        let denials = super::time::root_snapshot::read_in(&member, &tx, &raw)?;
+        let mut lists = 0;
+        denials.visit(&mut |ids| {
+            assert!(ids.is_empty());
+            lists += 1;
+            Ok(())
+        })?;
+        assert_eq!(lists, 2);
+        let saved_host = read(&member, "Host")?;
+        write(&member, "Host", b"{}")?;
+        assert!(super::time::root_snapshot::read_in(&member, &tx, &raw).is_err());
+        write(&member, "Host", &saved_host)?;
+        write(&member, "Policy", b"{}")?;
+        assert!(super::time::root_snapshot::read_in(&member, &tx, &raw).is_err());
+        count += 1;
+        Ok(())
+    })
+    .unwrap();
+    assert!(count > 0);
     let history = open(metadata.0, "history", true, Some(&tx))
         .unwrap()
         .unwrap();
