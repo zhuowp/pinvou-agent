@@ -301,6 +301,7 @@ impl<'a> RootReadSet<'a> {
             &self.guard,
             &self.tx,
         )?;
+        verified.prefix()?.verify_all_metadata()?;
         let snapshot = state_in_product(
             &private,
             &self.host,

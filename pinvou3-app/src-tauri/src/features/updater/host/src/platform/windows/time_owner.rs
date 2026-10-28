@@ -1,5 +1,6 @@
 //! Actual SCM-bound time acquisition. This batch commits evidence and a cleanup
 //! barrier only; it never advertises a durable Known clock or recovery permission.
+mod pending_root;
 use super::{
     installed::StartedServiceContext,
     original_root::ProtectedOriginalRoot,
@@ -15,6 +16,7 @@ use crate::{
     json,
     trusted_time::{CounterEvidence, Evidence, Incarnation, Status, root_version},
 };
+pub(super) use pending_root::{LateRootAcceptance, PendingRootTime};
 use pinvou_upgrade_codec::{Document, InputKind};
 use pinvou_upgrade_control_http::RootGetResult;
 use pinvou_upgrade_verifier::{
@@ -269,7 +271,16 @@ impl TimeOwner {
                         earliest: checked.earliest_millis(),
                         latest: checked.latest_millis(),
                     };
-                    return self.publish(host, &store, policy, &successors, denied, evidence);
+                    let pending = PendingRootTime::new(
+                        host,
+                        &successors,
+                        sent,
+                        verified_at,
+                        evidence,
+                        &trusted_root,
+                        &checked,
+                    )?;
+                    return self.publish(host, &store, policy, &successors, denied, pending);
                 }
             }
             // A missing successor is only a failed acquisition attempt, never
@@ -321,7 +332,7 @@ impl TimeOwner {
         policy: PolicySnapshot,
         successors: &RootScratch,
         denied: Vec<String>,
-        evidence: Evidence,
+        pending: PendingRootTime<'_, '_>,
     ) -> Result<()> {
         self.original.recheck(host)?;
         // Keep both same-thread recursive mutexes through both native commits
@@ -337,9 +348,9 @@ impl TimeOwner {
         next.status = Status::CleanupPending;
         next.cleanup_pending = true;
         next.zero_retention = None;
-        next.floor = Some(evidence.earliest);
+        next.floor = Some(pending.evidence().earliest);
         next.denied_key_ids = denied;
-        next.evidence = Some(evidence);
+        next.evidence = Some(pending.evidence().clone());
         // Refuse every further refresh after an ambiguous/erroring publisher.
         // Reopening authenticates actual committed state; it never resets it.
         self.commit_uncertain = true;
@@ -356,6 +367,7 @@ impl TimeOwner {
                 &policy,
                 next.evidence.as_ref().ok_or(Error::StateCorrupt)?,
                 successors,
+                Some(&pending),
             )?
         } else {
             next.validate(&self.snapshot.original_root)?;

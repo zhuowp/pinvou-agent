@@ -5,6 +5,8 @@ pub(super) mod member_history;
 mod metadata_samples;
 mod policy_fault;
 pub(super) mod root_history;
+mod root_publication;
+pub(in crate::platform::windows) use root_publication::RootPublicationClock;
 mod root_read_set;
 pub(super) mod root_snapshot;
 use super::super::installed::StartedServiceContext;
@@ -703,8 +705,8 @@ fn metadata_root_transition_error(error: Error) -> Error {
     }
 }
 
-// Until the product Root owner and all consumers are joined in one protected
-// transaction, an individual member cannot safely advance the product Root.
+// The legacy member-state writer preserves its Root sequence. Shared Root
+// changes belong exclusively to the protected V2 publication operation.
 fn require_product_root_ready(current: &[String], next: &[String]) -> Result<()> {
     if next != current {
         return Err(Error::SourceUnavailable);
@@ -2474,7 +2476,7 @@ impl Store {
     }
 
     /// Publish a member's own signed time at its persisted current product
-    /// position. Root changes remain behind the separate promotion gate.
+    /// position, delegating nonempty Root changes to the protected V2 owner.
     #[allow(unsafe_code)]
     pub(in crate::platform::windows) fn time_commit_compact_anchor(
         &self,
@@ -2483,11 +2485,18 @@ impl Store {
         captured: &PolicySnapshot,
         evidence: &Evidence,
         successors: &RootScratch,
+        pending: Option<&crate::platform::windows::time_owner::PendingRootTime<'_, '_>>,
     ) -> Result<TimeSnapshot> {
-        // Do not open the product-Root promotion path until its complete
-        // transaction, recovery and consumer checks have passed review.
         if successors.len() != 0 {
-            return Err(Error::SourceUnavailable);
+            return root_publication::publish(
+                self,
+                host,
+                expected,
+                captured,
+                evidence,
+                successors,
+                pending.ok_or(Error::SourceUnavailable)?,
+            );
         }
         successors.verify_all()?;
         let seed = &host.context.seed;
@@ -2500,18 +2509,13 @@ impl Store {
         host.authenticate_running(&actual)?;
         let private = self.key(true, Some(&tx))?.ok_or(Error::SetupIncomplete)?;
         let advanced = root_history::advanced_shape_in(seed, &tx)?;
-        let view = if advanced {
-            Some(root_history::VerifiedHistory::open(
-                seed, &actual, &guard, &tx,
-            )?)
-        } else {
-            None
-        };
-        let current = if let Some(view) = &view {
-            state_in_product(&private, &actual, seed, &guard, &tx, view)?
-        } else {
-            state_in(&private, &actual, Some(&tx))?
-        };
+        // Normal zero-successor genesis remains on time_commit. Local-only
+        // legacy rotations cannot be promoted by inventing shared witnesses.
+        if !advanced {
+            return Err(Error::SourceUnavailable);
+        }
+        let view = root_history::VerifiedHistory::open(seed, &actual, &guard, &tx)?;
+        let current = state_in_product(&private, &actual, seed, &guard, &tx, &view)?;
         if current.raw != expected.raw
             || current.original_root != expected.original_root
             || current.state.incarnation != Some(Incarnation::from_host(&actual)?)
@@ -2519,32 +2523,17 @@ impl Store {
         {
             return Err(Error::ScopeConflict);
         }
-        let position = if advanced {
-            Some(root_history::staged_position(
-                &root_history::protected_head_in(seed, &tx)?,
-            )?)
-        } else {
-            None
-        };
-        if u64::try_from(evidence.base_root_count).ok()
-            != Some(position.as_ref().map_or(0, |p| p.root_count))
-        {
+        let position = root_history::staged_position(&root_history::protected_head_in(seed, &tx)?)?;
+        if u64::try_from(evidence.base_root_count).ok() != Some(position.root_count) {
             return Err(Error::PrerequisiteUnavailable);
         }
         let key = open(private.0, NAMESPACE, true, Some(&tx))?.ok_or(Error::SetupIncomplete)?;
-        let caught_up = position
-            .as_ref()
-            .is_some_and(|p| current.state.product_root.as_ref() != Some(p));
+        let caught_up = current.state.product_root.as_ref() != Some(&position);
         if !caught_up && current.state.status != Status::Unknown {
             return Err(Error::ScopeConflict);
         }
         if caught_up {
-            check_catchup_in(
-                &key,
-                &current,
-                Incarnation::from_host(&actual)?,
-                position.as_ref().ok_or(Error::StateCorrupt)?,
-            )?;
+            check_catchup_in(&key, &current, Incarnation::from_host(&actual)?, &position)?;
         }
         let policy = policy_in(&key, &current.state.binding)?;
         if policy.raw != captured.raw || evidence.policy.as_bytes() != policy.raw {
@@ -2565,82 +2554,31 @@ impl Store {
         if evidence.floor_before != floor {
             return Err(Error::ScopeConflict);
         }
-        if let Some(history) = &view {
-            crate::trusted_time::check_history_time_bound(
-                history.latest_issue(),
-                evidence.earliest,
-            )
+        crate::trusted_time::check_history_time_bound(view.latest_issue(), evidence.earliest)
             .map_err(|_| Error::ScopeConflict)?;
-        }
         let mut next = current
             .state
             .next_unknown(Incarnation::from_host(&actual)?, &current.raw)?;
         next.status = Status::CleanupPending;
+        next.cleanup_pending = true;
+        next.zero_retention = None;
         next.floor = Some(evidence.earliest);
         next.denied_key_ids = denied;
         next.evidence = Some(evidence.clone());
         if caught_up {
-            next.product_root = position;
+            next.product_root = Some(position);
         }
-        let new_head = if successors.len() == 0 {
-            None
-        } else if advanced {
-            Some(root_history::stage_next_in(
-                seed,
-                &actual,
-                &guard,
-                &tx,
-                &root_history::protected_head_in(seed, &tx)?,
-                successors.len(),
-                |index| successors.read(index),
-                evidence,
-            )?)
-        } else {
-            let before = root_read_set::census(seed, &actual, &guard, &tx, false)?;
-            super::product_catalog::visit_members_in(seed, &actual, &tx, |event, member| {
-                metadata::require_member_empty_for_root_transition_in(seed, event, member, &tx)
-            })?;
-            let after = root_read_set::census(seed, &actual, &guard, &tx, false)?;
-            root_read_set::require_unchanged(&before, &after)?;
-            Some(root_history::stage_first_stream_in(
-                seed,
-                &actual,
-                &guard,
-                &tx,
-                evidence,
-                successors.len(),
-                &mut |index| successors.read(index),
-            )?)
-        };
-        let next_view = if let Some(head) = &new_head {
-            next.product_root = Some(root_history::staged_position(head)?);
-            Some(root_history::VerifiedHistory::open(
-                seed, &actual, &guard, &tx,
-            )?)
-        } else {
-            None
-        };
-        let active_view = next_view
-            .as_ref()
-            .or(view.as_ref())
-            .ok_or(Error::StateCorrupt)?;
-        let raw = if new_head.is_some() || caught_up {
+        let raw = if caught_up {
             current
                 .state
                 .transition_compact_shape(&next, &current.raw)?;
-            let _ = active_view.authenticate(&next)?;
+            let _ = view.authenticate(&next)?;
             let history = open(key.0, "history", true, Some(&tx))?.ok_or(Error::StateCorrupt)?;
             let revision = create(history.0, &revision_name(next.revision), &tx, false, true)?;
             let raw = write_record(&revision, &next)?;
             write(&key, "Head", &raw)?;
-            if state_in_product(&private, &actual, seed, &guard, &tx, active_view)?.raw != raw {
+            if state_in_product(&private, &actual, seed, &guard, &tx, &view)?.raw != raw {
                 return Err(Error::StateCorrupt);
-            }
-            // Root promotion must recheck every member after both Heads.
-            // A same-Root member catch-up need not require other members'
-            // current policies or grant any product-wide permission.
-            if new_head.is_some() {
-                root_read_set::census(seed, &actual, &guard, &tx, true)?;
             }
             raw
         } else {
@@ -2652,7 +2590,7 @@ impl Store {
                 seed,
                 &guard,
                 &tx,
-                Some(active_view),
+                Some(&view),
             )?
         };
         if caught_up && unsafe { RegDeleteValueW(key.0, wide("Catchup").as_ptr()) } != 0 {
@@ -2669,11 +2607,10 @@ impl Store {
             return Err(Error::ScopeConflict);
         }
         successors.verify_all()?;
-        active_view.recheck_head()?;
+        view.recheck_head()?;
         host.authenticate_running(&actual)?;
         drop(key);
         drop(private);
-        drop(next_view);
         drop(view);
         commit_time_transaction(&tx)?;
         drop(tx);
@@ -2689,16 +2626,6 @@ impl Store {
             .ok_or(Error::StateCommitUnknown)?;
             if unsafe { RegFlushKey(time.0) } != 0 || unsafe { RegFlushKey(revision.0) } != 0 {
                 return Err(Error::StateCommitUnknown);
-            }
-            if let Some(head) = &new_head {
-                root_history::flush_persisted(seed)?;
-                let replay = root_read_set::RootReadSet::new_persisted(host)?;
-                let index = successors
-                    .len()
-                    .checked_sub(1)
-                    .ok_or(Error::StateCommitUnknown)?;
-                let root = successors.read(index)?;
-                return replay.committed_member(head, &root, &raw);
             }
             let actual = self.read(seed)?.ok_or(Error::StateCommitUnknown)?;
             host.authenticate_running(&actual)?;
@@ -2756,19 +2683,8 @@ impl Store {
         if current.raw != expected.raw || current.original_root != expected.original_root {
             return Err(Error::ScopeConflict);
         }
-        // Bind every member, its protected policy and the product directory
-        // before evaluating an advancement. Recheck before staging any writes.
-        let root_read_set = if next.roots != current.state.roots {
-            Some(root_read_set::census(
-                seed,
-                &actual,
-                &_product_guard,
-                &transaction,
-                false,
-            )?)
-        } else {
-            None
-        };
+        // Root changes have one streamed V2 publisher. This legacy operation
+        // may preserve its existing Roots, never create a second promotion path.
         require_product_root_ready(&current.state.roots, &next.roots)?;
         if next.status == Status::CleanupPending {
             require_product_members_at_genesis_in(seed, &actual, &transaction)?;
@@ -2781,33 +2697,6 @@ impl Store {
         current
             .state
             .transition(next, &current.raw, &current.original_root)?;
-        // The temporary guard above currently rejects every Root change.
-        // Retain this census for the eventual product Root implementation;
-        // removing the guard requires reviewing this branch with that design.
-        if next.roots != current.state.roots {
-            super::product_catalog::visit_members_in(
-                seed,
-                &actual,
-                &transaction,
-                |event, member| {
-                    super::metadata::require_member_empty_for_root_transition_in(
-                        seed,
-                        event,
-                        member,
-                        &transaction,
-                    )?;
-                    check_member_denies_in(
-                        seed,
-                        event,
-                        member,
-                        next,
-                        &current.original_root,
-                        &transaction,
-                    )
-                },
-            )
-            .map_err(metadata_root_transition_error)?;
-        }
         let key =
             open(private.0, NAMESPACE, true, Some(&transaction))?.ok_or(Error::SetupIncomplete)?;
         match (next.status, policy) {
@@ -2858,34 +2747,7 @@ impl Store {
                 return Err(Error::ScopeConflict);
             }
         }
-        let product_head = if next.roots != current.state.roots {
-            let before = root_read_set.ok_or(Error::StateCorrupt)?;
-            let after = root_read_set::census(seed, &actual, &_product_guard, &transaction, false)?;
-            root_read_set::require_unchanged(&before, &after)?;
-            // The temporary product gate above currently refuses this branch.
-            // Once the compact-state path is verified, stage the product head
-            // and issuer revision under the same transaction and product lock.
-            Some(root_history::stage_prospective_first_in(
-                seed,
-                &actual,
-                &_product_guard,
-                &transaction,
-                next,
-            )?)
-        } else {
-            None
-        };
-        let stored = if let Some(head) = product_head.as_ref() {
-            let mut compact = next.clone();
-            compact.roots.clear();
-            compact.product_root = Some(root_history::staged_position(head)?);
-            current
-                .state
-                .transition_compact_shape(&compact, &current.raw)?;
-            compact
-        } else {
-            next.clone()
-        };
+        let stored = next.clone();
         let raw = json::encode(&header(&stored), false)?;
         let history =
             open(key.0, "history", true, Some(&transaction))?.ok_or(Error::StateCorrupt)?;
@@ -2900,25 +2762,9 @@ impl Store {
             return Err(Error::StateCorrupt);
         }
         write(&key, "Head", &raw)?;
-        let staged = if product_head.is_some() {
-            let verified =
-                root_history::VerifiedHistory::open(seed, &actual, &_product_guard, &transaction)?;
-            state_in_product(
-                &private,
-                &actual,
-                seed,
-                &_product_guard,
-                &transaction,
-                &verified,
-            )?
-        } else {
-            state_in(&private, &actual, Some(&transaction))?
-        };
+        let staged = state_in(&private, &actual, Some(&transaction))?;
         if staged.raw != raw {
             return Err(Error::StateCorrupt);
-        }
-        if product_head.is_some() {
-            root_read_set::census(seed, &actual, &_product_guard, &transaction, true)?;
         }
         drop(revision);
         drop(history);
@@ -2938,12 +2784,6 @@ impl Store {
             .ok_or(Error::StateCommitUnknown)?;
             if unsafe { RegFlushKey(key.0) } != 0 || unsafe { RegFlushKey(history.0) } != 0 {
                 return Err(Error::StateCommitUnknown);
-            }
-            if let Some(head) = product_head.as_ref() {
-                root_history::flush_persisted(seed)?;
-                let replay = root_read_set::RootReadSet::new_persisted(host)?;
-                let root = next.roots.last().ok_or(Error::StateCommitUnknown)?;
-                return replay.committed_member(head, root.as_bytes(), &raw);
             }
             let after = self.read(seed)?.ok_or(Error::StateCommitUnknown)?;
             host.authenticate_running(&after)?;

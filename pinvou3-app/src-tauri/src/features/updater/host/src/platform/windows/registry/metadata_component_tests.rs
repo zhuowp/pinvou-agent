@@ -166,6 +166,9 @@ pub(crate) fn run_isolated() {
         .expect("recheck original initial intent");
     historical_genesis_uses_transacted_registry(&store, &seed, &reopened);
     member_metadata_genesis_uses_actual_catalog(&store, &seed, &reopened);
+    if super::time::root_history::component_fixture::matches(&seed) {
+        root_publication_uses_signed_nonempty_cache(&store, &seed, &reopened);
+    }
     publication_staging_uses_transacted_registry(&store, &seed);
     waterlog_structure_uses_transacted_registry(&store, &seed, &reopened);
     if seed.original_root.sha256
@@ -292,6 +295,71 @@ fn historical_genesis_uses_transacted_registry(
     let source = super::time::current_in(&private, seed, host, &product, &tx).unwrap();
     super::time::component_test_historical_genesis(&source).unwrap();
     // Dropping the uncommitted transaction removes all damaged/extra rows.
+}
+
+/// Signed historical DATA under the existing isolated lab registry. This does
+/// not call the service-owned Root writer or manufacture its native clock proof.
+#[allow(unsafe_code)]
+fn root_publication_uses_signed_nonempty_cache(
+    store: &Store,
+    seed: &Seed,
+    host: &HostRegistration,
+) {
+    let before = || {
+        let private = store.key(false, None).unwrap().unwrap();
+        let metadata = open(private.0, "metadata-state-v1", false, None)
+            .unwrap()
+            .unwrap();
+        let time = open(private.0, "trusted-time-v1", false, None)
+            .unwrap()
+            .unwrap();
+        [
+            read(&private, METADATA_BOOTSTRAP_ROOT).unwrap(),
+            read(&metadata, "Head").unwrap(),
+            read(&metadata, "Policy").unwrap(),
+            read(&time, "Head").unwrap(),
+        ]
+    };
+    let original = before();
+    for exit_old_key in [true, false] {
+        {
+            let _profile = BootstrapGuard::acquire(seed, false).unwrap();
+            let product = product_catalog::ProductGuard::acquire(seed).unwrap();
+            let tx = Handle::owned(unsafe {
+                CreateTransaction(ptr::null_mut(), ptr::null_mut(), 0, 0, 0, 0, ptr::null())
+            })
+            .unwrap();
+            super::time::root_history::component_fixture::run(
+                seed,
+                host,
+                &product,
+                &tx,
+                exit_old_key,
+            )
+            .expect("signed nonempty native Root staging fixture");
+        }
+        assert!(
+            before() == original,
+            "discarded transaction must preserve all committed source Heads"
+        );
+        let private = store.key(false, None).unwrap().unwrap();
+        assert!(
+            open(private.0, "root-publication-staging-v2", false, None)
+                .unwrap()
+                .is_none()
+        );
+        let time = open(private.0, "trusted-time-v1", false, None)
+            .unwrap()
+            .unwrap();
+        assert!(
+            open(time.0, "root-acquisition-v1", false, None)
+                .unwrap()
+                .is_none()
+        );
+        product_catalog::check(seed, host, None)
+            .expect("discarded candidate must leave the committed product genesis unchanged");
+    }
+    println!("PINVOU_ROOT_PUBLICATION_DATA_TEST_PASSED");
 }
 
 /// Uses the real fixed catalog/profile source without constructing an SCM

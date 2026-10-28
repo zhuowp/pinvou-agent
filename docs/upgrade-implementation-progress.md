@@ -1,15 +1,30 @@
 # Upgrade implementation progress
 
-2026-10-29 T27 captured-prefix candidate: explicit
+2026-10-29 T27 production Root publication component: the actual TimeOwner routes
+nonempty streamed successors through the
+[protected V2 publication operation](client-upgrade-root-publication.md).
+It captures complete current member metadata, checks final-Root compatibility,
+atomically writes the product and issuer Heads, and takes a genuine native
+counter sample after full replay. Its dedicated sampler checks bounded native
+registration pins and SCM identity without replaying Root history after the
+counter observation. Commit, flush and readback uncertainty returns
+StateCommitUnknown. Native execution of this pipeline remains unverified; the local TxR environment
+fails before its first registry operation with ERROR_RM_NOT_ACTIVE (6801).
+Application update-check integration and full T27 acceptance remain incomplete.
+No E2E or deployment was run. Older entries below describe their delivery stage.
+
+2026-10-29 delivered captured-prefix component
+([PR 5](https://github.com/zhuowp/pinvou-agent/pull/5)): explicit
 [V2 member metadata witnesses](client-upgrade-captured-metadata-prefix.md)
 bind historical publication/waterlog ceilings and policies to actual Root batch
 members. Retained native prefixes share graph/time/water replay, and a separate
 batch traversal checks their latest graphs against the batch's signed final
 Root. Whole-member before/callback/after censuses also pin retained profiles.
-V1 remains lineage DATA and cannot imply empty metadata. This candidate is not
-yet delivered or independently reviewed. Root publisher integration, nonempty
-native pipeline execution and application update check remain incomplete.
-Production Root gates stay closed. No E2E or deployment was run.
+V1 remains lineage DATA and cannot imply empty metadata. The fixed component
+source review closed; 309 host tests passed, two first-operation TxR tests failed
+with 6801 and two opt-in tests were ignored. Its native fixture compiled but did
+not execute. Root publisher integration was still gated at that delivery; the
+component above builds on it. No E2E or deployment was run.
 
 2026-10-29 delivered current-member source ([PR 4](https://github.com/zhuowp/pinvou-agent/pull/4)): the
 [protected catalog member metadata source](client-upgrade-member-metadata-source.md)

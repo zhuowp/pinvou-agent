@@ -826,12 +826,16 @@ class CiGatePolicyTests(unittest.TestCase):
         for path in (
             ".github/workflows/pr-check.yml",
             "scripts/metadata-component-fixture.mjs",
+            "scripts/root-publication-fixture.mjs",
             "scripts/tests/test_ci_gate_policy.py",
             "pinvou3-app/scripts/tauri/windows-host-profile.js",
             "pinvou3-app/scripts/tauri/windows-host-build.js",
             "pinvou3-app/tests/windows_host_packaging.test.js",
             "pinvou3-app/src-tauri/src/features/updater/host/tests/metadata-component-fixture/root.json",
             "pinvou3-app/src-tauri/src/features/updater/host/tests/metadata-component-fixture/seed.json",
+            "pinvou3-app/src-tauri/src/features/updater/host/tests/root-publication-fixture/root.json",
+            "pinvou3-app/src-tauri/src/features/updater/host/tests/root-publication-fixture/seed.json",
+            "pinvou3-app/src-tauri/src/features/updater/host/tests/root-publication-fixture/fixture.json",
             "specs/upgrade/v1/reference/tests/fixtures.mjs",
             "specs/upgrade/v1/schemas/metadata/root.json",
         ):
@@ -844,6 +848,8 @@ class CiGatePolicyTests(unittest.TestCase):
         self.assertIn("Get-FileHash", step)
         self.assertIn("--features metadata-component-tests --bin metadata-component-test", step)
         self.assertIn("HOST_METADATA_TEST_PRODUCTION_REFUSED", step)
+        self.assertIn("PINVOU_ROOT_PUBLICATION_DATA_TEST_PASSED", step)
+        self.assertIn("Unexpected public Root-publication fixture", step)
         self.assertIn("$code -ne 0", step)
         self.assertIn(".Count -ne 1", step)
         self.assertNotIn("continue-on-error", step)
@@ -2715,6 +2721,8 @@ class CiGatePolicyTests(unittest.TestCase):
             "pinvou3-app/src-tauri/src/features/voice/voice_asr.rs",
             "pinvou3-app/src-tauri/src/features/updater/mod.rs",
             "pinvou3-app/src-tauri/src/features/updater/host/tests/product-root-history.json",
+            "pinvou3-app/src-tauri/src/features/updater/host/tests/root-publication-fixture/fixture.json",
+            "scripts/root-publication-fixture.mjs",
             "pinvou3-app/src-tauri/src/features/future_feature/mod.rs",
             "pinvou3-app/src-tauri/src/features/assistant/product_runtime/headless_bridge_contract_tests.rs",
         )

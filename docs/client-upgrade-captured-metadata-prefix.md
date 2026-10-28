@@ -3,7 +3,9 @@
 This T27 component verifies historical metadata under an authenticated native
 Root batch's captured member ceiling. It is DATA verification, with no running
 service, current clock, Root commit, update-check or installation capability.
-Production Root promotion gates remain closed.
+Production Root promotion remained gated at this component's delivery. The
+subsequent [publication component](client-upgrade-root-publication.md) integrates
+these witnesses; its execution and delivery status are recorded separately.
 
 ## Explicit witnesses and provenance
 
