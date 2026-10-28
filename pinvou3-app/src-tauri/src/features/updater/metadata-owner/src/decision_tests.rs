@@ -1,10 +1,36 @@
 use super::decision::verify_renewal;
-use super::{DecisionError, DecisionInputs, PriorWater, decide_public_metadata};
+use super::{
+    DecisionError, DecisionInputs, OwnedPriorWater, PriorWater, decide_public_metadata,
+    decide_public_metadata_owned, decide_public_metadata_source,
+};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use pinvou_upgrade_codec::decode_canonical_envelope;
 use pinvou_upgrade_codec::{Document, InputKind};
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, path::Path, process::Command};
+
+struct DropProbe {
+    inner: OwnedPriorWater,
+    live: std::rc::Rc<std::cell::Cell<usize>>,
+    dropped: std::rc::Rc<std::cell::Cell<usize>>,
+}
+impl super::decision::PriorItem for DropProbe {
+    fn record(&self) -> &Document {
+        &self.inner.record
+    }
+    fn previous_release(&self) -> Option<(&[u8], &pinvou_upgrade_codec::RootPolicyShape)> {
+        self.inner
+            .previous_release
+            .as_ref()
+            .map(|(bytes, root)| (bytes.as_slice(), root))
+    }
+}
+impl Drop for DropProbe {
+    fn drop(&mut self) {
+        self.live.set(self.live.get() - 1);
+        self.dropped.set(self.dropped.get() + 1);
+    }
+}
 
 fn document(value: &Value) -> Document {
     Document::parse(&serde_json::to_vec(value).unwrap(), InputKind::Metadata).unwrap()
@@ -123,6 +149,116 @@ fn signed_graph_requires_complete_success_and_each_protected_high_water() {
     let decision =
         decide_public_metadata(&timestamp, &snapshot, &members, inputs(), |_| Ok(None)).unwrap();
     assert_eq!(decision.updates().len(), 4); // timestamp, snapshot, target, release; not package
+    let mut source_reads = 0usize;
+    let source = decide_public_metadata_source(
+        &timestamp,
+        &snapshot,
+        members.len(),
+        |i| {
+            source_reads += 1;
+            Ok(members[i].to_vec())
+        },
+        inputs(),
+        |_| Ok(None),
+    )
+    .unwrap();
+    let fields = |d: &super::Decision| {
+        d.updates()
+            .iter()
+            .map(|w| (w.context().to_vec(), w.version(), w.sha256().to_owned()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(fields(&decision), fields(&source));
+    let later = document(&json!(case["now"].as_u64().unwrap() + 1))
+        .protocol_time_shape()
+        .unwrap();
+    let distinct_inputs = || DecisionInputs {
+        root: &trusted_root,
+        context: &context,
+        earliest: &time,
+        latest: &later,
+        denied: &[],
+        denied_by_role: &denied,
+    };
+    let distinct_slice =
+        decide_public_metadata_owned(&timestamp, &snapshot, &members, distinct_inputs(), |_| {
+            Ok(None)
+        })
+        .unwrap();
+    let distinct_source = decide_public_metadata_source(
+        &timestamp,
+        &snapshot,
+        members.len(),
+        |i| Ok(members[i].to_vec()),
+        distinct_inputs(),
+        |_| Ok(None),
+    )
+    .unwrap();
+    assert_eq!(fields(&distinct_slice), fields(&distinct_source));
+    let mut late_visits = 0;
+    assert!(matches!(
+        decide_public_metadata_source(
+            &timestamp,
+            &snapshot,
+            members.len(),
+            |i| Ok(members[i].to_vec()),
+            inputs(),
+            |ctx| {
+                late_visits += 1;
+                if ctx.value()["role"] == "release" {
+                    Err(DecisionError::PriorUnavailable)
+                } else {
+                    Ok(None)
+                }
+            }
+        ),
+        Err(DecisionError::PriorUnavailable)
+    ));
+    assert!(
+        late_visits > 1,
+        "late prior failure must not return earlier updates"
+    );
+    let final_pass_start = source_reads - members.len();
+    let mut count = 0usize;
+    assert!(matches!(
+        decide_public_metadata_source(
+            &timestamp,
+            &snapshot,
+            members.len(),
+            |i| {
+                let current = count;
+                count += 1;
+                if current == final_pass_start {
+                    Err(DecisionError::SourceUnavailable)
+                } else {
+                    Ok(members[i].to_vec())
+                }
+            },
+            inputs(),
+            |_| Ok(None)
+        ),
+        Err(DecisionError::SourceUnavailable)
+    ));
+    let mut count = 0usize;
+    assert!(matches!(
+        decide_public_metadata_source(
+            &timestamp,
+            &snapshot,
+            members.len(),
+            |i| {
+                let current = count;
+                count += 1;
+                Ok(if current == final_pass_start {
+                    members[(i + 1) % members.len()].to_vec()
+                } else {
+                    members[i].to_vec()
+                })
+            },
+            inputs(),
+            |_| Ok(None)
+        ),
+        Err(DecisionError::Verification)
+    ));
     let mut records = BTreeMap::new();
     for update in decision.updates() {
         let scope: Value = serde_json::from_slice(update.context()).unwrap();
@@ -144,6 +280,123 @@ fn signed_graph_requires_complete_success_and_each_protected_high_water() {
         .map(|d| d.updates().len())
     };
     assert_eq!(compare(&records), Ok(4));
+    let compare_owned = |map: &BTreeMap<Vec<u8>, Document>| {
+        decide_public_metadata_owned(&timestamp, &snapshot, &members, inputs(), |ctx| {
+            Ok(map
+                .get(&ctx.canonical_bytes().unwrap())
+                .map(|record| OwnedPriorWater {
+                    record: document(record.value()),
+                    previous_release: None,
+                }))
+        })
+        .map(|d| d.updates().len())
+    };
+    assert_eq!(compare_owned(&records), Ok(4));
+    let compare_source = |map: &BTreeMap<Vec<u8>, Document>| {
+        decide_public_metadata_source(
+            &timestamp,
+            &snapshot,
+            members.len(),
+            |i| Ok(members[i].to_vec()),
+            inputs(),
+            |ctx| {
+                Ok(map
+                    .get(&ctx.canonical_bytes().unwrap())
+                    .map(|record| OwnedPriorWater {
+                        record: document(record.value()),
+                        previous_release: None,
+                    }))
+            },
+        )
+        .map(|d| d.updates().len())
+    };
+    assert_eq!(compare_source(&records), Ok(4));
+    assert!(matches!(
+        decide_public_metadata_source(
+            &timestamp,
+            &snapshot,
+            members.len(),
+            |i| Ok(members[i].to_vec()),
+            inputs(),
+            |_| Err(DecisionError::PriorUnavailable)
+        ),
+        Err(DecisionError::PriorUnavailable)
+    ));
+    let live = std::rc::Rc::new(std::cell::Cell::new(0));
+    let dropped = std::rc::Rc::new(std::cell::Cell::new(0));
+    let probe = super::decision::decide_inner(&timestamp, &snapshot, &members, inputs(), |ctx| {
+        assert_eq!(
+            live.get(),
+            0,
+            "previous item must be released before the next read"
+        );
+        let record = records.get(&ctx.canonical_bytes().unwrap()).unwrap();
+        live.set(1);
+        Ok(Some(DropProbe {
+            inner: OwnedPriorWater {
+                record: document(record.value()),
+                previous_release: None,
+            },
+            live: live.clone(),
+            dropped: dropped.clone(),
+        }))
+    })
+    .unwrap();
+    assert_eq!(live.get(), 0);
+    assert_eq!(dropped.get(), 4);
+    let values = |d: &super::Decision| {
+        d.updates()
+            .iter()
+            .map(|w| (w.context().to_vec(), w.version(), w.sha256().to_owned()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(values(&decision), values(&probe));
+    dropped.set(0);
+    let source_probe = super::decision::decide_source_inner(
+        &timestamp,
+        &snapshot,
+        members.len(),
+        |i| Ok(members[i].to_vec()),
+        inputs(),
+        |ctx| {
+            assert_eq!(
+                live.get(),
+                0,
+                "previous source item must be released before the next read"
+            );
+            let record = records.get(&ctx.canonical_bytes().unwrap()).unwrap();
+            live.set(1);
+            Ok(Some(DropProbe {
+                inner: OwnedPriorWater {
+                    record: document(record.value()),
+                    previous_release: None,
+                },
+                live: live.clone(),
+                dropped: dropped.clone(),
+            }))
+        },
+    )
+    .unwrap();
+    assert_eq!(live.get(), 0);
+    assert_eq!(dropped.get(), 4);
+    assert_eq!(values(&decision), values(&source_probe));
+    let mut owned_visits = 0;
+    assert!(matches!(
+        decide_public_metadata_owned(&timestamp, &snapshot, &members, inputs(), |ctx| {
+            owned_visits += 1;
+            if ctx.value()["role"] == "release" {
+                return Err(DecisionError::PriorUnavailable);
+            }
+            Ok(records
+                .get(&ctx.canonical_bytes().unwrap())
+                .map(|record| OwnedPriorWater {
+                    record: document(record.value()),
+                    previous_release: None,
+                }))
+        }),
+        Err(DecisionError::PriorUnavailable)
+    ));
+    assert!(owned_visits > 1);
     let first = decision.updates()[0].context().to_vec();
     let scope: Value = serde_json::from_slice(&first).unwrap();
     let clone_records = || {
@@ -155,9 +408,13 @@ fn signed_graph_requires_complete_success_and_each_protected_high_water() {
     let mut rollback = clone_records();
     rollback.insert(first.clone(), document(&json!({"scope":scope,"version":decision.updates()[0].version()+1,"envelopeSha256":"0".repeat(64)})));
     assert_eq!(compare(&rollback), Err(DecisionError::Rollback));
+    assert_eq!(compare_owned(&rollback), Err(DecisionError::Rollback));
+    assert_eq!(compare_source(&rollback), Err(DecisionError::Rollback));
     let mut fork = clone_records();
     fork.insert(first, document(&json!({"scope":scope,"version":decision.updates()[0].version(),"envelopeSha256":"0".repeat(64)})));
     assert_eq!(compare(&fork), Err(DecisionError::Equivocation));
+    assert_eq!(compare_owned(&fork), Err(DecisionError::Equivocation));
+    assert_eq!(compare_source(&fork), Err(DecisionError::Equivocation));
     for role in ["target", "release"] {
         let item = decision
             .updates()
@@ -421,6 +678,33 @@ fn full_signed_graph_requires_the_matching_archived_release_for_renewal() {
         .map(|d| d.updates().len())
     };
     assert_eq!(call(&water, Some(&old)), Ok(4));
+    let owned = decide_public_metadata_owned(&timestamp, &snapshot, &members, inputs(), |ctx| {
+        Ok((ctx.value()["role"] == "release").then(|| OwnedPriorWater {
+            record: document(water.value()),
+            previous_release: Some((
+                old.clone(),
+                document(&case["root"]).root_policy_shape().unwrap(),
+            )),
+        }))
+    });
+    assert!(owned.is_ok());
+    let sourced = decide_public_metadata_source(
+        &timestamp,
+        &snapshot,
+        members.len(),
+        |i| Ok(members[i].to_vec()),
+        inputs(),
+        |ctx| {
+            Ok((ctx.value()["role"] == "release").then(|| OwnedPriorWater {
+                record: document(water.value()),
+                previous_release: Some((
+                    old.clone(),
+                    document(&case["root"]).root_policy_shape().unwrap(),
+                )),
+            }))
+        },
+    );
+    assert!(sourced.is_ok());
     assert_eq!(call(&water, None), Err(DecisionError::PriorUnavailable));
     assert_eq!(call(&water, Some(&other)), Err(DecisionError::InvalidPrior));
     assert_eq!(
@@ -435,4 +719,105 @@ fn full_signed_graph_requires_the_matching_archived_release_for_renewal() {
         call(&record(&corrupted), Some(&corrupted)),
         Err(DecisionError::ReleaseRenewal)
     );
+    assert!(matches!(
+        decide_public_metadata_source(
+            &timestamp,
+            &snapshot,
+            members.len(),
+            |i| Ok(members[i].to_vec()),
+            inputs(),
+            |ctx| {
+                Ok((ctx.value()["role"] == "release").then(|| OwnedPriorWater {
+                    record: record(&corrupted),
+                    previous_release: Some((
+                        corrupted.clone(),
+                        document(&case["root"]).root_policy_shape().unwrap(),
+                    )),
+                }))
+            }
+        ),
+        Err(DecisionError::ReleaseRenewal)
+    ));
+    let failed_owned =
+        decide_public_metadata_owned(&timestamp, &snapshot, &members, inputs(), |ctx| {
+            Ok((ctx.value()["role"] == "release").then(|| OwnedPriorWater {
+                record: record(&corrupted),
+                previous_release: Some((
+                    corrupted.clone(),
+                    document(&case["root"]).root_policy_shape().unwrap(),
+                )),
+            }))
+        });
+    assert!(matches!(failed_owned, Err(DecisionError::ReleaseRenewal)));
+}
+
+#[test]
+fn source_and_slice_decisions_agree_for_signed_graph_oracle() {
+    let root_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(6)
+        .unwrap();
+    let output = Command::new("node")
+        .args([
+            "--input-type=module",
+            "-e",
+            include_str!("../../protocol/verify/tests/public-chain-oracle.mjs"),
+        ])
+        .arg(root_dir.join("specs/upgrade/v1/reference/signatures.mjs"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let cases: Vec<Value> = serde_json::from_slice(&output.stdout).unwrap();
+    for case in &cases {
+        let root = document(&case["trustedRoot"]).root_policy_shape().unwrap();
+        let context = document(&case["context"]);
+        let time = document(&case["now"]).protocol_time_shape().unwrap();
+        let decode = |v: &Value| STANDARD.decode(v.as_str().unwrap()).unwrap();
+        let timestamp = decode(&case["timestamp"]);
+        let snapshot = decode(&case["snapshot"]);
+        let members: Vec<Vec<u8>> = case["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(decode)
+            .collect();
+        let borrowed: Vec<&[u8]> = members.iter().map(Vec::as_slice).collect();
+        let denied: Vec<String> = serde_json::from_value(case["deniedKeyIds"].clone()).unwrap();
+        let roles: BTreeMap<String, Vec<String>> =
+            serde_json::from_value(case["deniedKeyIdsByRole"].clone()).unwrap();
+        let inputs = || DecisionInputs {
+            root: &root,
+            context: &context,
+            earliest: &time,
+            latest: &time,
+            denied: &denied,
+            denied_by_role: &roles,
+        };
+        let slice =
+            decide_public_metadata_owned(&timestamp, &snapshot, &borrowed, inputs(), |_| Ok(None));
+        let source = decide_public_metadata_source(
+            &timestamp,
+            &snapshot,
+            members.len(),
+            |i| Ok(members[i].clone()),
+            inputs(),
+            |_| Ok(None),
+        );
+        let fields = |d: &super::Decision| {
+            d.updates()
+                .iter()
+                .map(|w| (w.context().to_vec(), w.version(), w.sha256().to_owned()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            slice.as_ref().ok().map(fields),
+            source.as_ref().ok().map(fields),
+            "{}",
+            case["name"]
+        );
+    }
 }

@@ -1,5 +1,15 @@
 # Upgrade implementation progress
 
+2026-10-29 migration continuation: restored client-01 at `6fb672cec` and
+matched all 37 saved file SHA-256 digests. The isolated delivery scope is the
+[supplied source metadata component](client-upgrade-source-metadata.md): exact
+per-object reread binding and owned/source high-water decisions. Other restored
+Windows host/time/waterlog and CI edits remain uncommitted candidates. The
+component grants no production authority and does not complete T27. Root
+promotion and production metadata writes remain gated. No E2E or deployment was
+run. Detailed independent review and execution evidence is retained separately
+from this concise progress summary.
+
 T27 protocol verifier component: the streamed time verifier checks each supplied
 Root in order, including both transition thresholds and the maximum issued time
 in that supplied chain. The caller must authenticate the initial Root, provide
