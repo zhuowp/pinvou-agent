@@ -1,5 +1,16 @@
 # Upgrade implementation progress
 
+2026-10-29 T27 publication candidate: a
+[native historical metadata owner](client-upgrade-metadata-publication.md)
+stages exact bounded originals, checks complete graphs against replayed waters,
+refreshes the actual same-source sample, and atomically journals originals,
+policies, active references and the trusted time floor. Commit/readback errors
+return Unknown; restart reads actual history. Cumulative role-deny rollback is
+rejected. The receipt is historical DATA, with no current-use or installation
+authority. Source review is in progress; full native pipeline execution remains
+blocked by registry RM error 6801, and no IPC/update-check route or Root promotion
+has been enabled. T27 remains incomplete. No E2E or deployment was run.
+
 2026-10-29 Windows T27 continuation candidate: the
 [native historical source component](client-upgrade-native-history.md) now
 connects actual same-transaction waterlog samples to historical signed time and

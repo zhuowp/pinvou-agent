@@ -1,5 +1,6 @@
-//! First-install Root watermark only. There is no metadata acceptance writer.
+//! Protected metadata history. Fresh-install checks remain genesis-only.
 mod policy;
+pub(super) mod publication;
 pub(super) mod replay;
 mod replay_index;
 pub(super) mod time_history;
@@ -53,8 +54,8 @@ fn exact_names(actual: &[String], expected: &[&str]) -> Result<()> {
 /// Prove the current owner has only its original empty genesis. This reads the
 /// actual protected namespace in the Root publisher's held transaction; an
 /// absent or unknown layout is never interpreted as an empty active set.
-/// Once an accepting metadata owner exists this gate must be replaced by a
-/// same-transaction complete active-set and Root-transition check.
+/// This gate remains until a same-transaction complete active-set and Root
+/// transition check exists. Historical publication alone cannot relax it.
 #[cfg(feature = "metadata-component-tests")]
 pub(super) fn require_empty_for_root_transition_in(
     private: &Key,

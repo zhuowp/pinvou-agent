@@ -1105,21 +1105,7 @@ impl HistoricalSample {
     ) -> Result<CapturedHistoricalSample<'read, 'tx>> {
         let first = super::super::live_time::sample_live_time(host, source)?;
         let sampled = first.recheck(host)?;
-        let bounds = sampled.bounds();
-        let incarnation = source
-            .state()
-            .incarnation
-            .clone()
-            .ok_or(Error::SourceUnavailable)?;
-        let sample = Self {
-            revision: source.state().revision,
-            head_sha256: source.head_sha256(),
-            incarnation,
-            counters: sampled.counter_evidence(),
-            earliest: bounds.earliest_millis(),
-            latest: bounds.latest_millis(),
-        };
-        Ok(CapturedHistoricalSample { source, sample })
+        CapturedHistoricalSample::from_live(source, sampled)
     }
 }
 /// Non-cloneable capture tied to the exact original guarded transaction.
@@ -1127,9 +1113,59 @@ impl HistoricalSample {
 pub(super) struct CapturedHistoricalSample<'read, 'tx> {
     source: &'read LiveTimeReadSet<'tx>,
     sample: HistoricalSample,
+    live: super::super::live_time::LiveTimeInterval<'read, 'tx>,
 }
 #[allow(dead_code)]
-impl CapturedHistoricalSample<'_, '_> {
+impl<'read, 'tx> CapturedHistoricalSample<'read, 'tx> {
+    fn from_live(
+        source: &'read LiveTimeReadSet<'tx>,
+        live: super::super::live_time::LiveTimeInterval<'read, 'tx>,
+    ) -> Result<Self> {
+        if !live.belongs_to(source) {
+            return Err(Error::ScopeConflict);
+        }
+        let bounds = live.bounds();
+        let incarnation = source
+            .state()
+            .incarnation
+            .clone()
+            .ok_or(Error::SourceUnavailable)?;
+        let sample = HistoricalSample {
+            revision: source.state().revision,
+            head_sha256: source.head_sha256(),
+            incarnation,
+            counters: live.counter_evidence(),
+            earliest: bounds.earliest_millis(),
+            latest: bounds.latest_millis(),
+        };
+        Ok(Self {
+            source,
+            sample,
+            live,
+        })
+    }
+
+    /// Observation DATA at this actual sample, not at return or commit time.
+    pub(super) fn bounds(&self) -> crate::trusted_time::UtcInterval {
+        self.live.bounds()
+    }
+
+    /// Resample the same native source, retaining actual monotonic continuity.
+    /// No serialized sample, caller counter or copied interval can enter here.
+    pub(super) fn refresh(&self, host: &StartedServiceContext) -> Result<Self> {
+        Self::from_live(self.source, self.live.recheck(host)?)
+    }
+
+    pub(super) fn live_for(
+        &self,
+        source: &LiveTimeReadSet<'_>,
+    ) -> Result<&super::super::live_time::LiveTimeInterval<'read, 'tx>> {
+        if !std::ptr::eq(self.source, source) || !self.live.belongs_to(source) {
+            return Err(Error::ScopeConflict);
+        }
+        Ok(&self.live)
+    }
+
     pub(super) fn bytes_for(
         &self,
         host: &StartedServiceContext,
