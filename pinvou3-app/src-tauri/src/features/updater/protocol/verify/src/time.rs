@@ -1,7 +1,7 @@
 //! Dedicated no-now time-response verification. The caller owns protected Root,
 //! deny/high-water storage, live nonce ownership and real monotonic observations.
 //! Successful DATA is not an installed clock, current rights or execution proof.
-use crate::{VerificationError, signatures};
+use crate::{ActiveMetadataInput, VerificationError, signatures};
 use pinvou_upgrade_codec::{
     InputKind, RootPolicyShape, SchemaCheckedEnvelope, TimeContractError, TimeRequestShape,
     decode_canonical_envelope,
@@ -97,6 +97,7 @@ pub struct SignatureCheckedTimeResponse {
     root_sha256: String,
     signer_ids: BTreeSet<String>,
     checked_steps: usize,
+    final_root: RootPolicyShape,
 }
 impl SignatureCheckedTimeResponse {
     pub fn envelope(&self) -> &SchemaCheckedEnvelope {
@@ -122,6 +123,15 @@ impl SignatureCheckedTimeResponse {
     }
     pub fn checked_root_steps(&self) -> usize {
         self.checked_steps
+    }
+    /// Check one original metadata member's full schema, expected context and
+    /// signatures against the final verified Root. This does not check body-time
+    /// freshness or establish a complete current inventory or publication right.
+    pub fn assert_active_binding(
+        &self,
+        input: &ActiveMetadataInput<'_>,
+    ) -> Result<(), VerificationError> {
+        crate::successor::verify_active_binding(input, &self.final_root)
     }
 }
 
@@ -304,6 +314,7 @@ pub fn verify_time_response_source<'a>(
         root_sha256: final_sha,
         signer_ids,
         checked_steps: count,
+        final_root: current.root,
     })
 }
 fn observed_round_trip(o: SuppliedTimeObservation) -> Result<u64, TimeVerificationError> {

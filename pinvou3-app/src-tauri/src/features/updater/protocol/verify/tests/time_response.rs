@@ -1,9 +1,9 @@
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use pinvou_upgrade_codec::{Document, InputKind};
 use pinvou_upgrade_verifier::{
-    SuppliedTimeObservation, TimeVerificationError, TimeVerificationInputs, VerificationError,
-    VerificationInputs, check_time_root_denials, verify_time_response, verify_time_response_source,
-    verify_time_root_successor, verify_with_supplied_root,
+    ActiveMetadataInput, SuppliedTimeObservation, TimeVerificationError, TimeVerificationInputs,
+    VerificationError, VerificationInputs, check_time_root_denials, verify_time_response,
+    verify_time_response_source, verify_time_root_successor, verify_with_supplied_root,
 };
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use serde_json::{Value, json};
@@ -75,7 +75,9 @@ fn fixture() -> Fixture {
             "version":version,"issuedAt":issued,"expiresAt":expires,
             "keys":keys.iter().map(|k| k.descriptor.clone()).collect::<Vec<_>>(),
             "roles":[{"role":"root","component":null,"channel":null,"targetKey":null,
-                      "threshold":2,"keyIds":keys.iter().map(|k|k.descriptor["keyId"].clone()).collect::<Vec<_>>()}],
+                      "threshold":2,"keyIds":keys.iter().map(|k|k.descriptor["keyId"].clone()).collect::<Vec<_>>()},
+                     {"role":"timestamp","component":"app","channel":null,"targetKey":null,
+                      "threshold":1,"keyIds":[keys[0].descriptor["keyId"]]}],
         })
     };
     let initial_claims = root(1, 0, 1, &old_keys);
@@ -122,6 +124,155 @@ fn observation() -> SuppliedTimeObservation {
         max_uncertainty_millis: 5,
         trusted_time_floor_millis: 99_995,
     }
+}
+
+fn active_timestamp() -> (Value, Document) {
+    // Deliberately expired: active binding authenticates original metadata, not
+    // body-time freshness or current selection eligibility.
+    let claims = json!({
+        "protocolVersion":1,"role":"timestamp","product":"pinvou","component":"app",
+        "scope":{},"version":1,"issuedAt":0,"expiresAt":1,
+        "snapshot":{"role":"snapshot","scope":{},"version":1,"expiresAt":1,
+                    "size":1,"envelopeSha256":"a".repeat(64)}
+    });
+    let expected =
+        document(&json!({"role":"timestamp","product":"pinvou","component":"app","scope":{}}));
+    (claims, expected)
+}
+
+#[test]
+fn active_binding_uses_final_rotated_keys_and_checks_original_schema_context_and_signatures() {
+    let f = fixture();
+    let request = document(&f.request).time_request_shape().unwrap();
+    let proof = verify_time_response_source(
+        &f.response,
+        &f.initial,
+        1,
+        |_| Ok(std::borrow::Cow::Borrowed(f.successor.as_slice())),
+        &request,
+        observation(),
+        &[],
+    )
+    .unwrap();
+    let (claims, expected) = active_timestamp();
+    let active = signed(&claims, &[&f.new_keys[0]]);
+    assert_eq!(
+        proof.assert_active_binding(&ActiveMetadataInput::new(&active, &expected)),
+        Ok(())
+    );
+    let retired = signed(&claims, &[&f.old_keys[0]]);
+    assert!(
+        proof
+            .assert_active_binding(&ActiveMetadataInput::new(&retired, &expected))
+            .is_err()
+    );
+
+    let mut damaged: Value = serde_json::from_slice(&active).unwrap();
+    damaged["signatures"][0]["signature"] = json!(URL_SAFE_NO_PAD.encode([0; 64]));
+    assert_eq!(
+        proof.assert_active_binding(&ActiveMetadataInput::new(
+            &document(&damaged).canonical_bytes().unwrap(),
+            &expected,
+        )),
+        Err(VerificationError::InvalidSignature)
+    );
+    for (field, value) in [
+        ("product", json!("other")),
+        ("component", json!("engine")),
+        ("role", json!("snapshot")),
+        ("scope", json!({"channel":"stable"})),
+    ] {
+        let mut context = expected.value().clone();
+        context[field] = value;
+        assert!(matches!(
+            proof.assert_active_binding(&ActiveMetadataInput::new(&active, &document(&context))),
+            Err(VerificationError::Context(_))
+        ));
+    }
+    let mut malformed = claims;
+    malformed.as_object_mut().unwrap().remove("snapshot");
+    assert!(matches!(
+        proof.assert_active_binding(&ActiveMetadataInput::new(
+            &signed(&malformed, &[&f.new_keys[0]]),
+            &expected,
+        )),
+        Err(VerificationError::Schema(_))
+    ));
+    let time_context =
+        document(&json!({"role":"time","product":"pinvou","component":"app","scope":{}}));
+    assert_eq!(
+        proof.assert_active_binding(&ActiveMetadataInput::new(&f.response, &time_context)),
+        Err(VerificationError::ActiveReadSetInvalid)
+    );
+}
+
+#[test]
+fn active_binding_survives_4097_streamed_successors_and_uses_the_last_root() {
+    let f = fixture();
+    let mut final_claims = f.final_claims.clone();
+    final_claims["version"] = json!(4098);
+    final_claims["roles"][1]["keyIds"] = json!([f.time_key.descriptor["keyId"]]);
+    let final_root = signed(&final_claims, &[&f.new_keys[0], &f.new_keys[1]]);
+    let reference = json!({"version":4098,"sha256":digest(&final_root)});
+    let mut request = f.request.clone();
+    request["root"] = reference.clone();
+    let request = document(&request).time_request_shape().unwrap();
+    let mut response = f.response_claims.clone();
+    response["root"] = reference;
+    let response = signed(&response, &[&f.time_key]);
+    let mut reads = 0;
+    let proof = verify_time_response_source(
+        &response,
+        &f.initial,
+        4097,
+        |i| {
+            assert_eq!(i, reads);
+            reads += 1;
+            let raw = if i == 0 {
+                f.successor.clone()
+            } else if i == 4096 {
+                final_root.clone()
+            } else {
+                let mut claims = f.final_claims.clone();
+                claims["version"] = json!(i + 2);
+                signed(&claims, &[&f.new_keys[0], &f.new_keys[1]])
+            };
+            Ok(std::borrow::Cow::Owned(raw))
+        },
+        &request,
+        observation(),
+        &[],
+    )
+    .unwrap();
+    assert_eq!(reads, 4097);
+    assert_eq!(proof.checked_root_steps(), 4097);
+    assert_eq!(proof.root_version(), 4098);
+    assert_eq!(proof.root_sha256(), digest(&final_root));
+    let (claims, expected) = active_timestamp();
+    assert_eq!(
+        proof.assert_active_binding(&ActiveMetadataInput::new(
+            &signed(&claims, &[&f.time_key]),
+            &expected,
+        )),
+        Ok(())
+    );
+    // This signer was authorized by every preceding successor, but not the last.
+    assert!(
+        proof
+            .assert_active_binding(&ActiveMetadataInput::new(
+                &signed(&claims, &[&f.new_keys[0]]),
+                &expected,
+            ))
+            .is_err()
+    );
+    assert!(
+        proof
+            .assert_active_binding(&ActiveMetadataInput::new(
+                &signed(&claims, &[&f.old_keys[0]]),
+                &expected,
+            ))
+            .is_err()
+    );
 }
 
 #[test]

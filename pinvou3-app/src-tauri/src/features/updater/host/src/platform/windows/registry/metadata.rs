@@ -1,4 +1,5 @@
 //! Protected metadata history. Fresh-install checks remain genesis-only.
+pub(super) mod member_source;
 mod policy;
 pub(super) mod publication;
 pub(super) mod replay;
