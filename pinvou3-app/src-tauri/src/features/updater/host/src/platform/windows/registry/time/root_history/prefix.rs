@@ -3,6 +3,10 @@
 //! fingerprint rechecks every retained original, evidence and member snapshot
 //! without recursively invoking semantic Root or metadata replay.
 use super::*;
+mod captured;
+pub(in crate::platform::windows::registry) use captured::CapturedRootMember;
+#[cfg(feature = "metadata-component-tests")]
+pub(in crate::platform::windows::registry) use captured::component_test_captured_prefix;
 
 type ProductGuard = super::super::super::product_catalog::ProductGuard;
 

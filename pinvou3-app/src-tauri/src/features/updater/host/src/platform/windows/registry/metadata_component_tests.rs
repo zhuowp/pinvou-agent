@@ -334,6 +334,46 @@ fn member_metadata_genesis_uses_actual_catalog(
             write(&metadata, name, &original)?;
             view.recheck()?;
         }
+        // Prepare outside the product subtree, preserving the accepted Root
+        // prefix while a future publisher assembles a new batch in this TxR.
+        let scratch = create(private.0, "captured-metadata-test", &tx, false, true)?;
+        let v1 = super::time::root_snapshot::capture_in(
+            &scratch,
+            "v1",
+            seed,
+            view.member().event(),
+            host,
+            &tx,
+        )?;
+        let v1_key = open(scratch.0, "v1", false, Some(&tx))?.ok_or(Error::StateCorrupt)?;
+        assert!(
+            matches!(
+                super::time::root_snapshot::read_captured_in(&v1_key, &tx, &v1),
+                Err(Error::SourceUnavailable)
+            ),
+            "legacy lineage data cannot assert an empty captured metadata set"
+        );
+        let v2 = super::time::root_snapshot::capture_metadata_in(
+            &scratch,
+            "v2",
+            seed,
+            view.member().event(),
+            host,
+            &product,
+            &tx,
+            None,
+            view,
+        )?;
+        let v2_key = open(scratch.0, "v2", true, Some(&tx))?.ok_or(Error::StateCorrupt)?;
+        let captured = super::time::root_snapshot::read_captured_in(&v2_key, &tx, &v2)?;
+        assert_eq!(captured.metadata().genesis, read(&metadata, "Genesis")?);
+        assert_eq!(captured.metadata().head, read(&metadata, "Head")?);
+        assert!(captured.state().binding == *view.member().binding());
+        let saved = read(&v2_key, "MetadataHead")?;
+        write(&v2_key, "MetadataHead", b"substituted-head")?;
+        assert!(super::time::root_snapshot::read_captured_in(&v2_key, &tx, &v2).is_err());
+        write(&v2_key, "MetadataHead", &saved)?;
+        super::time::root_snapshot::read_captured_in(&v2_key, &tx, &v2)?;
         Ok(())
     })
     .unwrap();
@@ -529,6 +569,16 @@ fn signed_history_replays_from_transacted_objects(
         write(&objects, name, &original).unwrap();
         advance(&mut cursor, 1).expect("second signed batch after failed reads");
         cursor.finish(2, 3, &json::sha256(&original)).unwrap();
+        super::time::root_history::component_test_captured_prefix(
+            &private,
+            seed,
+            host,
+            &_product,
+            &tx,
+            &batches[0],
+            |index| read(&objects, &format!("0-{index}")),
+        )
+        .expect("V2 captured source must come from actual signed native Root history");
     }
     let private = store.key(false, None).unwrap().unwrap();
     assert!(

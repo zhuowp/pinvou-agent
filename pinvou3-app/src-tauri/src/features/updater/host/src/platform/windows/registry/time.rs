@@ -1,5 +1,6 @@
 //! Fixed native64 protected time sibling. Missing is never a fresh owner.
 //! Its genesis is created exclusively inside original Store::commit(None).
+pub(super) mod captured_history;
 pub(super) mod member_history;
 mod metadata_samples;
 mod policy_fault;
