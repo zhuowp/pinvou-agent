@@ -1,7 +1,11 @@
 //! Immutable independent bootstrap anchor, not current metadata acceptance.
 //! No storage, system clock, native identity or online qualification is provided.
 mod binding;
+mod decision;
 pub use binding::BootstrapBinding;
+pub use decision::{
+    Decision, DecisionError, DecisionInputs, PriorWater, WaterUpdate, decide_public_metadata,
+};
 
 use pinvou_upgrade_codec::{Document, InputKind, decode_canonical_envelope};
 use pinvou_upgrade_verifier::{VerificationInputs, verify_with_supplied_root};
@@ -170,5 +174,7 @@ fn sha256(bytes: &[u8]) -> String {
         .collect()
 }
 
+#[cfg(test)]
+mod decision_tests;
 #[cfg(test)]
 mod tests;

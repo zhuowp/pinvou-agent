@@ -12,6 +12,16 @@ clock, or installation authority. Verifier tests cover 4097 signed Roots,
 the collection boundary and failure cases; Windows verifier tests, clippy and
 the architecture guard passed. Independent review remains pending. No E2E was run.
 
+T27 metadata decision candidate: the storage-independent core checks the complete
+signed public graph across supplied time bounds, per-context high waters, and
+authenticated Release renewal against the previous original. Signed-graph tests
+cover rollback, equivocation, source failures, denials, time boundaries and
+renewal; Windows metadata-owner tests and clippy passed. The inputs do not prove
+trusted time or protected state. The core is not yet connected to a production
+owner, atomic persistence, or the complete product-wide active set. Root promotion
+remains gated, independent review is in progress, and T27 is not complete. No E2E
+was run.
+
 T27 Windows time acquisition now performs a protected product-member census
 before any time or Root request, after invalidating an existing time observation.
 The publication transaction retains its own recheck. This is a temporary

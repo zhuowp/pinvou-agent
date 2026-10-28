@@ -887,6 +887,22 @@ class CiGatePolicyTests(unittest.TestCase):
         self.assertIn("cargo test --locked --test large_history", step)
         self.assertNotIn("continue-on-error:", step)
 
+    def test_metadata_decision_core_checks_are_routed(self):
+        block = self.pr_workflow.split("            rust_code:", 1)[1].split("            rust_dependencies:", 1)[0]
+        paths = _extract_quoted_paths(block)
+        for path in (
+            "pinvou3-app/src-tauri/src/features/updater/metadata-owner/src/decision.rs",
+            "pinvou3-app/src-tauri/src/features/updater/protocol/verify/tests/public-chain-oracle.mjs",
+            "pinvou3-app/src-tauri/src/features/updater/protocol/verify/tests/release-renewal-oracle.mjs",
+        ):
+            self.assertTrue(_matches_paths_filter(path, paths), path)
+        job = self.pr_workflow.split("\n  rust-lint:", 1)[1].split("\n  rust-test:", 1)[0]
+        step = job.split("- name: Check upgrade metadata decision core", 1)[1].split("\n      - name:", 1)[0]
+        self.assertIn("working-directory: pinvou3-app/src-tauri/src/features/updater/metadata-owner", step)
+        self.assertIn("cargo clippy --locked --all-targets -- -D warnings", step)
+        self.assertIn("cargo test --locked", step)
+        self.assertNotIn("continue-on-error:", step)
+
     def test_read_only_cache_byte_controls_run_on_native_windows(self):
         job = self.pr_workflow.split("\n  windows-rust-test:", 1)[1].split("\n  macos-rust-check:", 1)[0]
         step = job.split("- name: Check native Windows upgrade byte verification", 1)[1].split("\n      - name:", 1)[0]

@@ -1229,6 +1229,15 @@ jobs:
           cargo test --locked --test long_root_chain
           cargo test --locked --test large_history
 
+      - name: Check upgrade metadata decision core
+        working-directory: pinvou3-app/src-tauri/src/features/updater/metadata-owner
+        env:
+          CARGO_BUILD_JOBS: '2'
+        run: |
+          cargo fmt -- --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked
+
       - name: Check isolated durable metadata acceptance QA
         working-directory: pinvou3-app/src-tauri/src/features/updater/protocol/acceptance
         env:
