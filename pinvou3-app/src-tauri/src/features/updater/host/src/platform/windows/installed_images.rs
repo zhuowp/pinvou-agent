@@ -67,6 +67,12 @@ impl InstalledImages {
         }
         Ok(&self.diagnostic)
     }
+    pub(crate) fn source_semantics_json(&self) -> Result<Vec<u8>> {
+        if !self.verified {
+            return Err(Error::ImageRefused);
+        }
+        self.images.manifest.source_semantics_json()
+    }
     pub(crate) fn recheck(&mut self, cancelled: &mut dyn FnMut() -> bool) -> Result<()> {
         // A failed refresh cannot leave a currently usable diagnostic projection.
         self.verified = false;
@@ -82,6 +88,12 @@ impl InstalledImages {
         // Re-read the original root/shards against the protected registry head;
         // no missing/corrupt material is filled from the compiled configuration.
         let current_manifest = store.manifest(&self.seed, &before)?;
+        if current_manifest.source_semantics != self.images.manifest.source_semantics {
+            return Err(Error::StateCorrupt);
+        }
+        if let Some(declaration) = &current_manifest.source_semantics {
+            declaration.validate(&self.seed)?;
+        }
         self.images.targets.validate_known_contents_with_poll(
             &self.seed,
             &current_manifest,

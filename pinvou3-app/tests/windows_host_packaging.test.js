@@ -10,6 +10,7 @@ const { relativeName, inventorySources, buildInstallationManifest, hashFile } = 
 const { writeNativeInventory } = require("../scripts/tauri/windows-host-native-inventory.js");
 const { buildAppInventory } = require("../scripts/tauri/windows-host-inventory.js");
 const { prepareHostBuild } = require("../scripts/tauri/windows-host-build.js");
+const { loadSourceSemantics, snapshotSourceSemantics } = require("../scripts/tauri/windows-host-source-semantics.js");
 const { TEMPLATE, nsisFileVersion, renderInclude, nativeTool, runBuildTool, verifyInstallerCRC, packageHostNSIS, validateCompiledProfile } = require("../scripts/tauri/windows-host-nsis.js");
 const appRoot = path.resolve(__dirname, "..");
 const repoRoot = path.dirname(appRoot);
@@ -23,6 +24,129 @@ function temporary(t) {
   });
   return root;
 }
+
+function declaredSemantics(profile) {
+  const seed = profile.seed;
+  return { sourceSemanticsVersion: 1, ...Object.fromEntries(
+    ["product", "component", "targetKey", "profileKind", "profileId", "buildId", "layoutId", "appVersion"]
+      .map((key) => [key, seed[key]])), seedSha256: profile.seedSha256,
+    application: { identity: "declared-app", publisher: "declared-app-author" },
+    helper: { identity: "declared-helper", publisher: "declared-helper-author" },
+    launcher: { identity: "declared-launcher", publisher: "declared-launcher-author" },
+    supportedOwnershipProtocols: [], supportedDataFormats: [], supportedMigrationProtocols: [] };
+}
+
+test("explicit source declarations are closed, context-bound DATA without defaults", async (t) => {
+  const root = temporary(t), fixture = await profileFixture();
+  const profile = await validateSeed(fixture.seedBytes, fixture.rootBytes);
+  const value = declaredSemantics(profile), file = path.join(root, "declaration.json");
+  fs.writeFileSync(file, await canonicalBytes(value));
+  assert.deepEqual(JSON.parse(JSON.stringify(await loadSourceSemantics(profile, { PINVOU_HOST_SOURCE_SEMANTICS: file }))), value);
+  assert.equal(await loadSourceSemantics(profile, {}), null);
+  await assert.rejects(loadSourceSemantics(null, { PINVOU_HOST_SOURCE_SEMANTICS: file }));
+  for (const mutate of [x=>{x.sourceSemanticsVersion=2;}, x=>{x.trusted=true;},
+    x=>{delete x.application;}, x=>{delete x.helper.publisher;}, x=>{x.launcher.identity="Company Name";},
+    x=>{x.application.identity="declared-app\n";}, x=>{x.supportedMigrationProtocols=["proto\n"];},
+    x=>{x.supportedDataFormats=["v1","v1"];}, x=>{x.supportedMigrationProtocols=Array.from({length:65},(_,i)=>`p${i}`);}]) {
+    const changed=structuredClone(value);mutate(changed);
+    await assert.rejects(snapshotSourceSemantics(profile,changed));
+  }
+  for (const key of ["product","component","targetKey","profileKind","profileId","buildId","layoutId","appVersion","seedSha256"]) {
+    const changed=structuredClone(value);changed[key]="wrong";
+    await assert.rejects(snapshotSourceSemantics(profile,changed));
+  }
+  const maximum=structuredClone(value);maximum.supportedDataFormats=Array.from({length:64},(_,i)=>`p${i}`);
+  maximum.supportedOwnershipProtocols=["owner-v1","Owner-v1"];
+  assert.deepEqual(JSON.parse(JSON.stringify(await snapshotSourceSemantics(profile,maximum))),maximum);
+  for (const bytes of [Buffer.concat([await canonicalBytes(value),Buffer.from("\n")]),
+    Buffer.from((await canonicalBytes(value)).toString().replace('{','{"sourceSemanticsVersion":1,'))]) {
+    fs.writeFileSync(file,bytes);
+    await assert.rejects(loadSourceSemantics(profile,{PINVOU_HOST_SOURCE_SEMANTICS:file}));
+  }
+});
+
+test("manifest v3 binds owned declarations to actual final hashes; omission preserves v2", async (t) => {
+  const root=temporary(t), fixture=await profileFixture();
+  const profile=await validateSeed(fixture.seedBytes,fixture.rootBytes);
+  const image=path.join(root,"ordinary-not-a-role.txt");fs.writeFileSync(image,"declaration DATA fixture, not a signed image");
+  const options={profile,helper:image,launcher:image,appBinary:image,resourceManifest:{files:[]},tauriRoot:root};
+  const legacy=await buildInstallationManifest({...options,nativeCheck:async()=>{}});
+  assert.equal(legacy.manifest.hostManifestVersion,2);
+  assert.equal(Object.hasOwn(legacy.manifest,"sourceSemantics"),false);
+  const declaration=declaredSemantics(profile),original=structuredClone(declaration);
+  const v3=await buildInstallationManifest({...options,sourceSemantics:declaration,nativeCheck:async()=>{
+    declaration.application.publisher="changed-by-caller";
+  }});
+  assert.equal(v3.manifest.hostManifestVersion,3);
+  assert.deepEqual(JSON.parse(JSON.stringify(v3.manifest.sourceSemantics)),original);
+  for(const role of ["app","helper","launcher"]) {
+    assert.equal(v3.manifest[role].sha256,sha256(fs.readFileSync(image)));
+    assert.equal(v3.manifest[role].size,fs.statSync(image).size);
+  }
+  const after=await buildInstallationManifest({...options,nativeCheck:async()=>{}});
+  assert.deepEqual(after.bytes,legacy.bytes);
+  assert.deepEqual(after.shards.map(x=>x.bytes),legacy.shards.map(x=>x.bytes));
+});
+
+test("frozen v3 manifest is emitted by the real builder for the Rust inventory reader", async (t) => {
+  const root=temporary(t), base=path.join(appRoot,"src-tauri/src/features/updater/host/tests");
+  const profile=await validateSeed(fs.readFileSync(path.join(base,"metadata-component-fixture/seed.json")),
+    fs.readFileSync(path.join(base,"metadata-component-fixture/root.json")));
+  const image=path.join(root,"not-an-executable.txt");
+  fs.writeFileSync(image,"Public declaration fixture DATA; not an executable.\n");
+  const result=await buildInstallationManifest({profile,helper:image,launcher:image,appBinary:image,
+    resourceManifest:{files:[]},tauriRoot:root,nativeCheck:async()=>{},sourceSemantics:declaredSemantics(profile)});
+  assert.deepEqual(result.bytes,fs.readFileSync(path.join(base,"source-semantics-fixture/manifest.json")));
+  assert.equal(result.shards.length,1);
+  assert.deepEqual(result.shards[0].bytes,fs.readFileSync(path.join(base,"source-semantics-fixture/inventory-0.json")));
+  // This proves producer/reader DATA format, not a signed role or native installation.
+});
+
+test("actual native v3 resources reject missing declarations, downgrade and substitution", {
+  skip: process.platform !== "win32",
+}, async (t) => {
+  const root=temporary(t), fixture=await profileFixture();
+  const profile=await validateSeed(fixture.seedBytes,fixture.rootBytes);
+  const ordinary=path.join(root,"ordinary-not-a-role.txt");fs.writeFileSync(ordinary,"native resource DATA only");
+  const result=await buildInstallationManifest({profile,helper:ordinary,launcher:ordinary,appBinary:ordinary,
+    resourceManifest:{files:[]},tauriRoot:root,nativeCheck:async()=>{},sourceSemantics:declaredSemantics(profile)});
+  const manifest=path.join(root,"installation-manifest.json");fs.writeFileSync(manifest,result.bytes);
+  for(const shard of result.shards) fs.writeFileSync(path.join(root,`installation-inventory-${shard.index}.json`),shard.bytes);
+  // Only modify a private disposable copy. It is never executed or trusted as a role.
+  const image=path.join(root,"resource-data-only.exe");fs.copyFileSync(process.execPath,image);
+  const options={cwd:root,logFile:path.join(root,"native-resource.log")};
+  try {
+    await nativeTool("Embed",["-Image",image,"-Manifest",manifest],options);
+    await nativeTool("Read",["-Image",image,"-Manifest",manifest],options);
+  } catch(error) {
+    t.diagnostic(fs.readFileSync(options.logFile,"utf8"));
+    throw error;
+  }
+  for(const mutate of [x=>{x.hostManifestVersion=2;},x=>{delete x.sourceSemantics;},
+    x=>{x.sourceSemantics.profileId="wrong";},x=>{x.sourceSemantics.application.publisher="not a logical id";},
+    x=>{x.sourceSemantics.supportedDataFormats=["same","same"];},x=>{x.sourceSemantics.trusted=true;},
+    x=>{x.sourceSemantics.application.identity="declared-app\n";},
+    x=>{x.sourceSemantics.supportedMigrationProtocols=["proto\n"]; }]) {
+    const changed=structuredClone(result.manifest);mutate(changed);
+    const invalid=path.join(root,"invalid.json");fs.writeFileSync(invalid,await canonicalBytes(changed));
+    const fresh=path.join(root,"fresh-data-only.exe");fs.copyFileSync(process.execPath,fresh);
+    const pristine=await hashFile(fresh);
+    await assert.rejects(nativeTool("Embed",["-Image",fresh,"-Manifest",invalid],options));
+    assert.deepEqual(await hashFile(fresh),pristine);
+    // Positive control on this SAME fresh file excludes "already embedded" refusals.
+    await nativeTool("Embed",["-Image",fresh,"-Manifest",manifest],options);
+    await nativeTool("Read",["-Image",fresh,"-Manifest",manifest],options);
+    fs.unlinkSync(fresh);
+  }
+  const changed=structuredClone(result.manifest);changed.sourceSemantics.helper.publisher="other-declared-author";
+  changed.sourceSemantics.supportedOwnershipProtocols=["Case","case"];
+  const alternate=path.join(root,"alternate.json");fs.writeFileSync(alternate,await canonicalBytes(changed));
+  const alternateImage=path.join(root,"alternate-data-only.exe");fs.copyFileSync(process.execPath,alternateImage);
+  await nativeTool("Embed",["-Image",alternateImage,"-Manifest",alternate],options);
+  await assert.rejects(nativeTool("Read",["-Image",alternateImage,"-Manifest",manifest],options));
+  await nativeTool("Read",["-Image",alternateImage,"-Manifest",alternate],options);
+  await nativeTool("Read",["-Image",image,"-Manifest",manifest],options);
+});
 test("source-structure guards retain identical main semantics for LF and CRLF", () => {
   const source = fs.readFileSync(path.join(appRoot, "scripts/tauri/build.js"), "utf8").replaceAll("\r\n", "\n");
   const pattern = /\nasync function main\(\) \{\n([\s\S]*?)\n\}\n/u;
@@ -167,6 +291,26 @@ test("enabled wrapper closes routes and preserves the default-off argument path"
   ]) { const target = path.join(root, file); fs.writeFileSync(target, bytes); environment[key] = target; }
   const options = { appRoot, environment, platform: "win32", architecture: "x64" };
   const plan = await prepareHostBuild(["build", "--bundles", "nsis"], options);
+  assert.equal(plan.sourceSemantics, null);
+  const declaration = declaredSemantics(plan.profile);
+  const declarationFile = path.join(root, "source-semantics.json");
+  fs.writeFileSync(declarationFile, await canonicalBytes(declaration));
+  environment.PINVOU_HOST_SOURCE_SEMANTICS = declarationFile;
+  const declaredPlan = await prepareHostBuild(["build", "--bundles", "nsis"], options);
+  assert.deepEqual(JSON.parse(JSON.stringify(declaredPlan.sourceSemantics)), declaration);
+  // The plan owns the loaded bytes even if the public input file is replaced.
+  const invalidDeclaration = structuredClone(declaration);
+  invalidDeclaration.application.identity = "not a logical identifier";
+  fs.writeFileSync(declarationFile, await canonicalBytes(invalidDeclaration));
+  await assert.rejects(prepareHostBuild(["build", "--bundles", "nsis"], options));
+  assert.deepEqual(JSON.parse(JSON.stringify(declaredPlan.sourceSemantics)), declaration);
+  let effects = 0;
+  await assert.rejects(packageHostNSIS({ profile: plan.profile,
+    effectiveConfig: { version: plan.profile.seed.appVersion },
+    sourceSemantics: invalidDeclaration,
+    run: async () => { effects++; }, native: async () => { effects++; } }));
+  assert.equal(effects, 0);
+  delete environment.PINVOU_HOST_SOURCE_SEMANTICS;
   assert.deepEqual(plan.args, ["build", "--target", "x86_64-pc-windows-msvc", "--features", "upgrade-host-lab", "--no-bundle"]);
   assert.match(plan.appBinary, /x86_64-pc-windows-msvc[\\/]release[\\/]pinvou3-tauri\.exe$/u);
   for (const args of [["build"], ["bundle", "--bundles", "nsis"], ["build", "--bundles", "msi"],

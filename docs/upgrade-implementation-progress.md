@@ -1,5 +1,14 @@
 # Upgrade implementation progress
 
+2026-10-29 T27 direct prerequisite: explicit
+[image-bound source declarations](client-upgrade-source-semantics.md) now flow
+from the existing project build entry through manifest v3, native resources and
+the protected retained-image consumer. V2 remains compatible and has no inferred
+declarations. This is declaration DATA only. Actual ownership/data/migration
+state, installation/channel owners and SourceFacts digest preimages remain
+unfinished; online check integration and full T27 remain incomplete. Actual
+SCM/TxR execution remains unverified. No E2E or deployment was run.
+
 2026-10-29 T27 metadata final observation: a
 [prepared native view](client-upgrade-metadata-final-observation.md) separates
 complete callback/source/original replay from bounded final sampling and commit.

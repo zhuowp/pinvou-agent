@@ -4,6 +4,7 @@ const path = require("node:path");
 const { spawn, execFile } = require("node:child_process");
 const { canonicalBytes, codec, refuse, sha256, validateHostApplicationConfig, imageCertificatePolicy, hostNamespace } = require("./windows-host-profile.js");
 const { buildInstallationManifest, hashFile, inventorySources, relativeName } = require("./windows-host-manifest.js");
+const { snapshotSourceSemantics } = require("./windows-host-source-semantics.js");
 const { MAXIMUM_FILES } = require("./windows-host-inventory.js");
 const { writeNativeInventory } = require("./windows-host-native-inventory.js");
 const { assertHostRoleImage } = require("./windows-host-role-pe.js");
@@ -162,8 +163,9 @@ async function verifyInstallerCRC(file) {
 
 async function packageHostNSIS({ profile, appBinary, helper, launcher, cli, resourceManifest,
   effectiveConfig, tauriRoot, outputParent, signer, makensis, environment = process.env,
-  run = runBuildTool, native = nativeTool }) {
+  run = runBuildTool, native = nativeTool, sourceSemantics = null }) {
   validateHostApplicationConfig(profile, effectiveConfig);
+  const declaration = sourceSemantics === null ? null : await snapshotSourceSemantics(profile, sourceSemantics);
   nsisFileVersion(profile.seed.appVersion); // Before any packaging effects.
   if (process.platform !== "win32") refuse("HOST_BUILD_PLATFORM_UNSUPPORTED");
   const certificatePolicy = imageCertificatePolicy(profile.seed);
@@ -247,6 +249,7 @@ async function packageHostNSIS({ profile, appBinary, helper, launcher, cli, reso
   const actualResources = { files: copied.filter((x) => x.relativeName !== "pinvou3-tauri.exe")
     .map((x) => ({ source: path.relative(root, x.source), destination: x.relativeName, kind: "file" })) };
   const result = await buildInstallationManifest({ profile, helper: helperCopy, launcher: launcherCopy,
+    sourceSemantics: declaration,
     appBinary: path.join(appRoot, "pinvou3-tauri.exe"), resourceManifest: actualResources, tauriRoot: root,
     nativeCheck: async (entries) => {
       finalControls = await writeNativeInventory(finalControlDirectory, entries);

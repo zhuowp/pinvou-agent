@@ -222,6 +222,31 @@ public static class PinvouHostBuildResource {
   function Assert-Hash($Value) {
     if ($Value -isnot [string] -or $Value -cnotmatch '^[0-9a-f]{64}$') { throw 'hash' }
   }
+  function Assert-LogicalIdentifier($Value) {
+    # .NET '$' also matches before a final LF; require the entire identifier.
+    if ($Value -isnot [string] -or $Value -cnotmatch '\A[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\z') { throw 'identifier' }
+  }
+  function Assert-SourceSemantics($Declaration,$RootManifest) {
+    Assert-Object $Declaration @('sourceSemanticsVersion','product','component','targetKey','profileKind','profileId','buildId','layoutId','appVersion','seedSha256','application','helper','launcher','supportedOwnershipProtocols','supportedDataFormats','supportedMigrationProtocols')
+    Assert-Integer $Declaration.sourceSemanticsVersion 1 1
+    foreach ($key in @('product','component','targetKey','profileKind','profileId','buildId','layoutId','seedSha256')) {
+      if ($Declaration.$key -isnot [string] -or $Declaration.$key -cne $RootManifest.$key) { throw 'semantics scope' }
+    }
+    if ($Declaration.appVersion -isnot [string] -or $Declaration.appVersion -cne $RootManifest.app.version) { throw 'semantics version' }
+    foreach ($role in @('application','helper','launcher')) {
+      Assert-Object $Declaration.$role @('identity','publisher')
+      Assert-LogicalIdentifier $Declaration.$role.identity
+      Assert-LogicalIdentifier $Declaration.$role.publisher
+    }
+    foreach ($key in @('supportedOwnershipProtocols','supportedDataFormats','supportedMigrationProtocols')) {
+      Assert-Array $Declaration.$key 0 64
+      $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+      foreach ($identifier in $Declaration.$key) {
+        Assert-LogicalIdentifier $identifier
+        if (!$seen.Add($identifier)) { throw 'semantics duplicate' }
+      }
+    }
+  }
   function Byte-Hash([byte[]]$Bytes) {
     $hash = [Security.Cryptography.SHA256]::Create()
     try { return ([BitConverter]::ToString($hash.ComputeHash($Bytes))).Replace('-','').ToLowerInvariant() } finally { $hash.Dispose() }
@@ -249,9 +274,10 @@ public static class PinvouHostBuildResource {
   function Read-ManifestResources([string]$File) {
     $root = Read-BoundedJson $File
     $manifestValue = $root.Value
-    Assert-Object $manifestValue @('hostManifestVersion','profileKind','profileId','product','component','targetKey','buildId','seedSha256','originalRoot','layoutId','helper','launcher','app','appInventory')
-    Assert-Integer $manifestValue.hostManifestVersion 2 2
-    if ($manifestValue.hostManifestVersion -cne 2) { throw 'version' }
+    Assert-Integer $manifestValue.hostManifestVersion 2 3
+    $manifestKeys = @('hostManifestVersion','profileKind','profileId','product','component','targetKey','buildId','seedSha256','originalRoot','layoutId','helper','launcher','app','appInventory')
+    if ($manifestValue.hostManifestVersion -ceq 3) { $manifestKeys += 'sourceSemantics' }
+    Assert-Object $manifestValue $manifestKeys
     if ($manifestValue.profileKind -cnotin @('lab','production') -or $manifestValue.profileId -isnot [string] -or
         $manifestValue.profileId -cnotmatch '^[a-z0-9][a-z0-9-]{0,47}$' -or
         ($manifestValue.profileKind -ceq 'production' -and $manifestValue.profileId.Contains('-fault-')) -or
@@ -272,6 +298,7 @@ public static class PinvouHostBuildResource {
           $imageValue.version -isnot [string] -or $imageValue.version -cnotmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' -or
           $imageValue.version -cne $manifestValue.app.version) { throw 'image' }
     }
+    if ($manifestValue.hostManifestVersion -ceq 3) { Assert-SourceSemantics $manifestValue.sourceSemantics $manifestValue }
     $inventoryValue = $manifestValue.appInventory
     Assert-Object $inventoryValue @('hostInventoryVersion','fileCount','totalSize','shards')
     Assert-Integer $inventoryValue.hostInventoryVersion 1 1

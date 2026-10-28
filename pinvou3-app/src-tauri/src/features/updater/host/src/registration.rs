@@ -537,6 +537,7 @@ mod privacy_tests {
         let manifest = InstallationManifest {
             root: crate::profile::RootManifest {
                 host_manifest_version: 2,
+                source_semantics: None,
                 profile_kind: seed.profile_kind.clone(),
                 profile_id: seed.profile_id.clone(),
                 product: seed.product.clone(),

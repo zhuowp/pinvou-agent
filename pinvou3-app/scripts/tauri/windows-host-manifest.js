@@ -4,6 +4,7 @@ const path = require("node:path");
 const { createHash } = require("node:crypto");
 const { canonicalBytes, MAXIMUM_MANIFEST_BYTES, refuse } = require("./windows-host-profile.js");
 const { MAXIMUM_FILES, relativeName, buildAppInventory } = require("./windows-host-inventory.js");
+const { snapshotSourceSemantics } = require("./windows-host-source-semantics.js");
 function noReparseAncestors(file) {
   let current = path.resolve(file);
   for (;;) {
@@ -75,7 +76,8 @@ function inventorySources({ appBinary, resourceManifest, tauriRoot }) {
 }
 
 async function buildInstallationManifest({ profile, helper, launcher, appBinary,
-  resourceManifest, tauriRoot, nativeCheck }) {
+  resourceManifest, tauriRoot, nativeCheck, sourceSemantics = null }) {
+  const declaration = sourceSemantics === null ? null : await snapshotSourceSemantics(profile, sourceSemantics);
   if (typeof nativeCheck !== "function") refuse("HOST_BUILD_NATIVE_CHECK_REQUIRED");
   const entries = inventorySources({ appBinary, resourceManifest, tauriRoot });
   // Actual Windows CompareStringOrdinal and native file-attribute inspection,
@@ -89,12 +91,13 @@ async function buildInstallationManifest({ profile, helper, launcher, appBinary,
   const main = appFiles.find((item) => item.relativeName === "pinvou3-tauri.exe");
   if (main.size < 1) refuse("HOST_BUILD_FILE_INVALID");
   const inventory = await buildAppInventory(profile, appFiles);
-  const manifest = { hostManifestVersion: 2, profileKind: seed.profileKind,
+  const manifest = { hostManifestVersion: declaration === null ? 2 : 3, profileKind: seed.profileKind,
     profileId: seed.profileId, product: seed.product, component: seed.component,
     targetKey: seed.targetKey, buildId: seed.buildId, seedSha256: profile.seedSha256,
     originalRoot: seed.originalRoot, layoutId: seed.layoutId,
     helper: image(await hashFile(helper, { allowEmpty: false })), launcher: image(await hashFile(launcher, { allowEmpty: false })),
     app: image({ size: main.size, sha256: main.sha256 }), appInventory: inventory.appInventory };
+  if (declaration !== null) manifest.sourceSemantics = declaration;
   const bytes = await canonicalBytes(manifest);
   if (manifest.app.size < 1) refuse("HOST_BUILD_FILE_INVALID");
   if (bytes.length > MAXIMUM_MANIFEST_BYTES) refuse("HOST_BUILD_MANIFEST_CAPACITY");

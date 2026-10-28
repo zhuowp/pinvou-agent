@@ -29,6 +29,14 @@ impl InstalledImageObservation {
     pub fn diagnostic_json(&self) -> Result<Vec<u8>> {
         serde_json::to_vec(self.inner.diagnostic()?).map_err(|_| Error::Unavailable)
     }
+
+    /// Supported-semantics declaration bound to the last complete native image
+    /// inspection. This is historical declaration DATA, not SourceFacts, actual
+    /// ownership/data state, mode certification or current upgrade eligibility.
+    /// Missing legacy declarations remain unavailable; no defaults are inferred.
+    pub fn source_semantics_json(&self) -> Result<Vec<u8>> {
+        self.inner.source_semantics_json()
+    }
 }
 
 /// Inspect ONLY this independently compiled host's registered installation.

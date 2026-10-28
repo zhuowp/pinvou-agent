@@ -230,8 +230,7 @@ jobs:
               - 'pinvou3-app/src-tauri/src/features/updater/**'
               - 'pinvou3-app/src-tauri/Cargo.toml'
               - 'pinvou3-app/src-tauri/rust-toolchain.toml'
-              - 'pinvou3-app/scripts/tauri/windows-host-profile.js'
-              - 'pinvou3-app/scripts/tauri/windows-host-build.js'
+              - 'pinvou3-app/scripts/tauri/windows-host-*'
               - 'pinvou3-app/tests/windows_host_packaging.test.js'
               - 'scripts/metadata-component-fixture.mjs'
               - 'scripts/root-publication-fixture.mjs'
@@ -241,6 +240,7 @@ jobs:
               - 'pinvou3-app/src-tauri/src/features/updater/host/tests/metadata-component-fixture/**'
               - 'pinvou3-app/src-tauri/src/features/updater/host/tests/metadata-component-history-fixture/**'
               - 'pinvou3-app/src-tauri/src/features/updater/host/tests/root-publication-fixture/**'
+              - 'pinvou3-app/src-tauri/src/features/updater/host/tests/source-semantics-fixture/**'
               - 'pinvou3-app/src-tauri/src/features/updater/host/tests/product-root-history.json'
               - 'scripts/metadata-component-fixture.mjs'
               - 'scripts/root-publication-fixture.mjs'
@@ -282,6 +282,7 @@ jobs:
               # The signed host history fixture is read by Windows host tests.
               - 'pinvou3-app/src-tauri/src/features/updater/host/tests/product-root-history.json'
               - 'pinvou3-app/src-tauri/src/features/updater/host/tests/root-publication-fixture/**'
+              - 'pinvou3-app/src-tauri/src/features/updater/host/tests/source-semantics-fixture/**'
               - 'scripts/root-publication-fixture.mjs'
               # Round-1 fix wave (PR #715 review): the loong64 cross-pipeline
               # scripts are build inputs of the rust legs — the pr-check
@@ -2023,6 +2024,13 @@ jobs:
       CARGO_BUILD_JOBS: '2'
     steps:
       - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+      - name: Install declaration reference dependencies
+        run: npm --prefix specs/upgrade/v1 ci --ignore-scripts --no-audit --no-fund
+      - name: Check actual Windows host packaging resources
+        run: node --test pinvou3-app/tests/windows_host_packaging.test.js
       - uses: dtolnay/rust-toolchain@stable
       - name: Use project Rust toolchain
         shell: bash
@@ -2041,6 +2049,15 @@ jobs:
           if ((Get-FileHash -Algorithm SHA256 -LiteralPath $env:PINVOU_HOST_BOOTSTRAP_SEED).Hash -ne '8C8FF90906149A7F411C96211C66A36A5ADAB45009BF0A2E38CD241C7187F454' -or
               (Get-FileHash -Algorithm SHA256 -LiteralPath $env:PINVOU_HOST_INITIAL_ROOT).Hash -ne '79C68C47565C54580FD41E00125650C227B8300EBA7A99949E79DC1EC7848B25') { throw 'Unexpected public test fixture' }
           $env:RUSTFLAGS = "$env:RUSTFLAGS -C target-feature=+crt-static"
+          # DATA interoperability uses the same fixed embedded Seed/Root. This
+          # opt-in test must execute rather than silently remain ignored.
+          $declarationTest = 'source_semantics::tests::actual_js_manifest_and_inventory_bind_the_same_declaration_bytes'
+          $declarationOutput = cargo test --manifest-path pinvou3-app/src-tauri/src/features/updater/host/Cargo.toml --target x86_64-pc-windows-msvc --locked --lib --features metadata-component-tests $declarationTest -- --ignored --exact 2>&1 | Tee-Object -Variable declarationLines
+          $declarationCode = $LASTEXITCODE
+          $declarationOutput | ForEach-Object { Write-Host $_ }
+          if ($declarationCode -ne 0 -or ($declarationLines -join "`n") -notmatch '1 passed; 0 failed; 0 ignored') {
+            throw 'Source declaration producer/reader DATA test failed or did not run'
+          }
           $rejected = cargo check --manifest-path pinvou3-app/src-tauri/src/features/updater/host/Cargo.toml --target x86_64-pc-windows-msvc --locked --lib --features metadata-component-tests,production 2>&1 | Out-String
           if ($LASTEXITCODE -eq 0 -or $rejected -notmatch 'HOST_METADATA_TEST_PRODUCTION_REFUSED') { throw 'Test feature must reject production builds' }
           $output = cargo run --manifest-path pinvou3-app/src-tauri/src/features/updater/host/Cargo.toml --target x86_64-pc-windows-msvc --locked --features metadata-component-tests --bin metadata-component-test 2>&1 | Tee-Object -Variable outputLines

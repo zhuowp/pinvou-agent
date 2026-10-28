@@ -1,5 +1,10 @@
 # Windows host packaging
 
+Optional `PINVOU_HOST_SOURCE_SEMANTICS` supplies public, explicit
+[image-bound source declarations](client-upgrade-source-semantics.md) to the
+same build entry. It selects manifest v3; omission preserves manifest v2.
+Declarations do not certify actual installed SourceFacts or current eligibility.
+
 This opt-in build profile packages the T31 helper and stable launcher through
 the existing `npm --prefix pinvou3-app run build:nsis` entry. It supports only
 an explicitly selected **lab** or **production** profile. Default builds keep
