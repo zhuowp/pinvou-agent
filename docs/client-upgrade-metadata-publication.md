@@ -4,8 +4,7 @@ The native metadata owner can publish checked historical observations and reload
 their receipts. This is passive trust-cache storage, not online qualification,
 current eligibility, an upgrade Session or installation permission. No IPC or
 application update-check route has been enabled by this component. Product Root
-promotion still requires the separate complete active-set transition and keeps
-its existing emptiness gate.
+promotion uses the separate [protected V2 operation](client-upgrade-root-publication.md).
 
 `Store::publish_metadata` takes an actual started-service context and bounded
 raw Timestamp, Snapshot and member originals. It acquires its own bootstrap and
@@ -22,7 +21,12 @@ exact current policies are rechecked, the final originals are copied and reread,
 and staging is deleted before commit. An unlinked new waterlog row is never
 introduced while prior lookups still expect the old complete inventory.
 
-The final observation refreshes the genuine same-source native counter witness.
+The [final observation](client-upgrade-metadata-final-observation.md) uses a
+prepared same-transaction view and a dedicated genuine native counter witness.
+Full source and original-custody replay finishes before this counter read.
+Bounded registration, time, policy and Root pins plus actual SCM identity bracket
+it; no complete history traversal follows before commit. A distinct final
+observation type carries this native proof into journal serialization.
 It must advance both original bounds monotonically, and its latest bound must
 remain strictly before the earliest expiry of Root and every expiring metadata
 object. Package has no expiry. The complete graph has already been verified on

@@ -2,7 +2,7 @@
 use super::*;
 use crate::platform::windows::{
     installed::StartedServiceContext,
-    registry::time::{CapturedHistoricalSample, LiveTimeReadSet},
+    registry::time::{FinalMetadataObservation, LiveTimeReadSet},
 };
 
 #[derive(Serialize, Deserialize, PartialEq, Eq)]
@@ -154,7 +154,7 @@ impl Pending<'_> {
         private: &Key,
         host: &StartedServiceContext,
         source: &LiveTimeReadSet<'_>,
-        sample: &CapturedHistoricalSample<'_, '_>,
+        sample: &FinalMetadataObservation<'_, '_, '_>,
         global: &[u8],
         roles: &[u8],
     ) -> Result<Position> {

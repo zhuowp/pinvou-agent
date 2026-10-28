@@ -165,6 +165,7 @@ pub(crate) fn run_isolated() {
         .verify_initial_metadata(&seed, &reopened)
         .expect("recheck original initial intent");
     historical_genesis_uses_transacted_registry(&store, &seed, &reopened);
+    metadata_finalization_pins_use_transacted_registry(&store, &seed, &reopened);
     member_metadata_genesis_uses_actual_catalog(&store, &seed, &reopened);
     if super::time::root_history::component_fixture::matches(&seed) {
         root_publication_uses_signed_nonempty_cache(&store, &seed, &reopened);
@@ -295,6 +296,33 @@ fn historical_genesis_uses_transacted_registry(
     let source = super::time::current_in(&private, seed, host, &product, &tx).unwrap();
     super::time::component_test_historical_genesis(&source).unwrap();
     // Dropping the uncommitted transaction removes all damaged/extra rows.
+}
+
+/// Native pin DATA only. No finalization, service or positive clock is minted.
+#[allow(unsafe_code)]
+fn metadata_finalization_pins_use_transacted_registry(
+    store: &Store,
+    seed: &Seed,
+    host: &HostRegistration,
+) {
+    {
+        let _profile = BootstrapGuard::acquire(seed, false).unwrap();
+        let product = product_catalog::ProductGuard::acquire(seed).unwrap();
+        let tx = Handle::owned(unsafe {
+            CreateTransaction(ptr::null_mut(), ptr::null_mut(), 0, 0, 0, 0, ptr::null())
+        })
+        .unwrap();
+        let private = store.key(true, Some(&tx)).unwrap().unwrap();
+        super::time::component_test_metadata_finalization_pins_in(
+            &private, seed, host, &product, &tx,
+        )
+        .expect("native finalization pin mutations and restoration");
+    }
+    assert_eq!(
+        store.read(seed).unwrap().unwrap().digest().unwrap(),
+        host.digest().unwrap()
+    );
+    assert_eq!(store.time_load(seed, host).unwrap().state.revision, 1);
 }
 
 /// Signed historical DATA under the existing isolated lab registry. This does

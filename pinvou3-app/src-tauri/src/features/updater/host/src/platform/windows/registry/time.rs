@@ -2,6 +2,12 @@
 //! Its genesis is created exclusively inside original Store::commit(None).
 pub(super) mod captured_history;
 pub(super) mod member_history;
+mod metadata_finalization;
+#[cfg(feature = "metadata-component-tests")]
+pub(in crate::platform::windows::registry) use metadata_finalization::component_test_metadata_finalization_pins_in;
+pub(in crate::platform::windows) use metadata_finalization::{
+    FinalMetadataObservation, MetadataFinalization,
+};
 mod metadata_samples;
 mod policy_fault;
 pub(super) mod root_history;
