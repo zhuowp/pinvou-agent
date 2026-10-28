@@ -30,6 +30,13 @@ impl InstalledImageObservation {
         serde_json::to_vec(self.inner.diagnostic()?).map_err(|_| Error::Unavailable)
     }
 
+    /// Recheck the real retained source and return its persisted seven-field API
+    /// scope as historical DATA. These bytes do not retain native authority.
+    pub fn check_scope_json(&mut self, cancelled: impl FnMut() -> bool) -> Result<Vec<u8>> {
+        self.recheck(cancelled)?;
+        self.inner.check_scope_json()
+    }
+
     /// Supported-semantics declaration bound to the last complete native image
     /// inspection. This is historical declaration DATA, not SourceFacts, actual
     /// ownership/data state, mode certification or current upgrade eligibility.

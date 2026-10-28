@@ -2066,6 +2066,23 @@ jobs:
           if ($code -ne 0 -or @($outputLines | Where-Object { $_ -eq 'PINVOU_METADATA_COMPONENT_TEST_PASSED' }).Count -ne 1) {
             throw 'Protected metadata component test failed or did not run'
           }
+          # Validate the actual reopened native owner's output with the existing
+          # frozen API schema oracle, rather than a separately invented fixture.
+          $scopePrefix = 'PINVOU_NATIVE_CHECK_SCOPE_JSON='
+          $scopeLines = @($outputLines | Where-Object { $_.ToString().StartsWith($scopePrefix, [StringComparison]::Ordinal) })
+          if ($scopeLines.Count -ne 1) { throw 'Native check-scope output missing or duplicated' }
+          $scopeJson = $scopeLines[0].ToString().Substring($scopePrefix.Length)
+          if ([Text.Encoding]::UTF8.GetByteCount($scopeJson) -gt 4096) { throw 'Native check-scope output too large' }
+          if (-not [IO.Path]::IsPathRooted($env:RUNNER_TEMP)) { throw 'Expected absolute runner temporary directory' }
+          $scopePath = Join-Path $env:RUNNER_TEMP ('pinvou-native-check-scope-' + [Guid]::NewGuid().ToString('N') + '.json')
+          try {
+            [IO.File]::WriteAllText($scopePath, $scopeJson, [Text.UTF8Encoding]::new($false))
+            node specs/upgrade/v1/reference/cli.mjs schema api/scope $scopePath
+            if ($LASTEXITCODE -ne 0) { throw 'Native check-scope API schema mismatch' }
+          } finally {
+            # The synchronous oracle has exited; delete only this owned file.
+            if (Test-Path -LiteralPath $scopePath) { Remove-Item -LiteralPath $scopePath -Force }
+          }
           # Exercise signed multi-batch replay with a second fixed public lab
           # anchor using the same isolated component binary and cleanup rules.
           $dir = Join-Path $env:GITHUB_WORKSPACE 'pinvou3-app/src-tauri/src/features/updater/host/tests/metadata-component-history-fixture'

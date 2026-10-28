@@ -30,6 +30,9 @@ pub(crate) fn finish_current_cli_worker(_: i32) -> Result<i32> {
 }
 pub(crate) struct InstalledImages;
 impl InstalledImages {
+    pub(crate) fn check_scope_json(&self) -> Result<Vec<u8>> {
+        Err(Error::Unsupported)
+    }
     pub(crate) fn source_semantics_json(&self) -> Result<Vec<u8>> {
         Err(Error::Unsupported)
     }

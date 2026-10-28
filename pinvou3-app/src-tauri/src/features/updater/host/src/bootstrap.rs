@@ -7,7 +7,7 @@ use crate::{
 use pinvou_upgrade_metadata_owner::{BootstrapAnchor, BootstrapBinding as MetadataBinding};
 use pinvou_upgrade_ownership::{BootstrapBinding as OwnershipBinding, InitialOwnership};
 
-pub(crate) fn namespaces() -> Vec<String> {
+fn prior_namespaces() -> Vec<String> {
     [
         "bootstrap-v1",
         pinvou_upgrade_metadata_owner::BOOTSTRAP_NAMESPACE,
@@ -18,8 +18,18 @@ pub(crate) fn namespaces() -> Vec<String> {
     .collect()
 }
 
-pub(crate) fn initialized(names: &[String]) -> bool {
+pub(crate) fn namespaces() -> Vec<String> {
+    let mut names = prior_namespaces();
+    names.push(crate::check_scope::NAMESPACE.into());
+    names
+}
+
+pub(crate) fn has_check_scope(names: &[String]) -> bool {
     names == namespaces()
+}
+
+pub(crate) fn initialized(names: &[String]) -> bool {
+    names == prior_namespaces() || has_check_scope(names)
 }
 
 pub(crate) fn valid_namespaces(names: &[String], profile_kind: &str) -> bool {
@@ -93,7 +103,13 @@ mod tests {
         assert!(valid_namespaces(&["bootstrap-v1".into()], "lab"));
         assert!(!valid_namespaces(&["bootstrap-v1".into()], "production"));
         assert!(!initialized(&["bootstrap-v1".into()]));
+        let prior = prior_namespaces();
+        assert!(initialized(&prior));
+        assert!(valid_namespaces(&prior, "production"));
+        assert!(valid_namespaces(&prior, "lab"));
+        assert!(!has_check_scope(&prior));
         let complete = namespaces();
+        assert!(has_check_scope(&complete));
         assert!(initialized(&complete));
         assert!(valid_namespaces(&complete, "production"));
         assert!(!valid_namespaces(&complete, "unknown"));

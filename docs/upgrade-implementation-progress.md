@@ -1,5 +1,13 @@
 # Upgrade implementation progress
 
+2026-10-29 T27 direct prerequisite: a
+[native initial check-scope owner](client-upgrade-native-check-scope.md) joins
+actual first-install protected storage and retained inspection.
+It supplies a distinct persisted installId and initial Stable/channelRevision-1
+record for fresh installations. Legacy state is not backfilled. This does not
+implement channel switching, migration, complete SourceFacts or online checks.
+Native installed SCM/TxR execution remains unverified; no E2E/deployment.
+
 2026-10-29 T27 direct prerequisite: explicit
 [image-bound source declarations](client-upgrade-source-semantics.md) now flow
 from the existing project build entry through manifest v3, native resources and
