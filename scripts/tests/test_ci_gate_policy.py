@@ -830,12 +830,18 @@ class CiGatePolicyTests(unittest.TestCase):
             "scripts/tests/test_ci_gate_policy.py",
             "pinvou3-app/scripts/tauri/windows-host-profile.js",
             "pinvou3-app/scripts/tauri/windows-host-build.js",
+            "pinvou3-app/scripts/tauri/windows-host-manifest.js",
+            "pinvou3-app/scripts/tauri/windows-host-source-semantics.js",
+            "pinvou3-app/scripts/tauri/windows-host-nsis.js",
+            "pinvou3-app/scripts/tauri/windows-host-resource.ps1",
             "pinvou3-app/tests/windows_host_packaging.test.js",
             "pinvou3-app/src-tauri/src/features/updater/host/tests/metadata-component-fixture/root.json",
             "pinvou3-app/src-tauri/src/features/updater/host/tests/metadata-component-fixture/seed.json",
             "pinvou3-app/src-tauri/src/features/updater/host/tests/root-publication-fixture/root.json",
             "pinvou3-app/src-tauri/src/features/updater/host/tests/root-publication-fixture/seed.json",
             "pinvou3-app/src-tauri/src/features/updater/host/tests/root-publication-fixture/fixture.json",
+            "pinvou3-app/src-tauri/src/features/updater/host/tests/source-semantics-fixture/manifest.json",
+            "pinvou3-app/src-tauri/src/features/updater/host/tests/source-semantics-fixture/inventory-0.json",
             "specs/upgrade/v1/reference/tests/fixtures.mjs",
             "specs/upgrade/v1/schemas/metadata/root.json",
         ):
@@ -844,10 +850,18 @@ class CiGatePolicyTests(unittest.TestCase):
         step = job.split("- name: Check protected Windows metadata initialization", 1)[1].split("\n      - name:", 1)[0]
         self.assertIn("needs.changes.outputs.metadata_component == 'true'", job)
         self.assertIn("github.event.pull_request.draft == false", job)
+        self.assertIn("runs-on: windows-latest", job)
+        self.assertIn("node-version: '22'", job)
+        self.assertIn("npm --prefix specs/upgrade/v1 ci --ignore-scripts --no-audit --no-fund", job)
+        self.assertIn("node --test pinvou3-app/tests/windows_host_packaging.test.js", job)
         self.assertIn("WindowsBuiltInRole]::Administrator", step)
         self.assertIn("Get-FileHash", step)
         self.assertIn("--features metadata-component-tests --bin metadata-component-test", step)
         self.assertIn("HOST_METADATA_TEST_PRODUCTION_REFUSED", step)
+        self.assertIn("source_semantics::tests::actual_js_manifest_and_inventory_bind_the_same_declaration_bytes", step)
+        self.assertIn("$declarationTest -- --ignored --exact", step)
+        self.assertIn("1 passed; 0 failed; 0 ignored", step)
+        self.assertIn("$declarationCode -ne 0", step)
         self.assertIn("PINVOU_ROOT_PUBLICATION_DATA_TEST_PASSED", step)
         self.assertIn("Unexpected public Root-publication fixture", step)
         self.assertIn("$code -ne 0", step)

@@ -260,11 +260,18 @@ pub(crate) struct RootManifest {
     pub(crate) launcher: ImageReference,
     pub(crate) app: ImageReference,
     pub(crate) app_inventory: crate::inventory::InventoryDescriptor,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) source_semantics: Option<crate::source_semantics::SourceSemanticsDeclaration>,
 }
 impl RootManifest {
     pub(crate) fn parse(bytes: &[u8], seed: &Seed) -> Result<Self> {
         let value: Self = json::decode(bytes, false).map_err(|_| Error::ImageRefused)?;
-        if value.host_manifest_version != 2
+        let declaration_valid = match (value.host_manifest_version, &value.source_semantics) {
+            (2, None) => true,
+            (3, Some(declaration)) => declaration.validate(seed).is_ok(),
+            _ => false,
+        };
+        if !declaration_valid
             || value.profile_kind != seed.profile_kind
             || value.profile_id != seed.profile_id
             || value.product != seed.product
@@ -283,6 +290,15 @@ impl RootManifest {
         value.app.validate(seed)?;
         value.app_inventory.validate()?;
         Ok(value)
+    }
+
+    /// Image-bound supported declarations only, never actual current facts.
+    /// Legacy manifests remain usable without inventing missing semantics.
+    pub(crate) fn source_semantics_json(&self) -> Result<Vec<u8>> {
+        self.source_semantics
+            .as_ref()
+            .ok_or(Error::SourceUnavailable)?
+            .canonical_bytes()
     }
 }
 

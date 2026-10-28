@@ -4,6 +4,7 @@ const path = require("node:path");
 const { spawn } = require("node:child_process");
 const { loadBuildProfile, refuse, imageCertificatePolicy } = require("./windows-host-profile.js");
 const { packageHostNSIS, nsisFileVersion } = require("./windows-host-nsis.js");
+const { loadSourceSemantics } = require("./windows-host-source-semantics.js");
 
 const HOST_FEATURE = "upgrade-host-lab";
 const PRODUCTION_HOST_FEATURE = "upgrade-host-production";
@@ -19,6 +20,7 @@ async function prepareHostBuild(args, { environment = process.env, platform = pr
   architecture = process.arch, appRoot } = {}) {
   const appVersion = JSON.parse(fs.readFileSync(path.join(appRoot, "src-tauri/tauri.conf.json"), "utf8")).version;
   const profile = await loadBuildProfile({ environment, appVersion });
+  const sourceSemantics = await loadSourceSemantics(profile, environment);
   if (!profile) return null;
   nsisFileVersion(profile.seed.appVersion); // Before the native application build.
   if (platform !== "win32" || architecture !== "x64" || args[0] !== "build") refuse("HOST_BUILD_PLATFORM_UNSUPPORTED");
@@ -62,7 +64,7 @@ async function prepareHostBuild(args, { environment = process.env, platform = pr
   const signer = certificatePolicy.kind === "legacy-selected-signer"
     || environment.PINVOU_HOST_SIGNER_SCRIPT !== undefined
     ? requiredFile(environment, "PINVOU_HOST_SIGNER_SCRIPT", ".ps1") : null;
-  return { profile, args: rewritten, targetRoot,
+  return { profile, sourceSemantics, args: rewritten, targetRoot,
     cliDebug: debug,
     appBinary: path.join(targetRoot, TRIPLE, debug ? "debug" : "release", "pinvou3-tauri.exe"),
     helper: requiredFile(environment, "PINVOU_HOST_HELPER_BINARY", ".exe"),

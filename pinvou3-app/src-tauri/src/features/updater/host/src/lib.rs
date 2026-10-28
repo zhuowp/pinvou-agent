@@ -30,6 +30,7 @@ mod profile;
 mod registration;
 mod restart;
 mod retention_custody;
+mod source_semantics;
 mod time_budget;
 mod time_status;
 mod trusted_time;
