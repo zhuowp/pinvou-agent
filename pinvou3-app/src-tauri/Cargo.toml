@@ -1,6 +1,6 @@
 [package]
 name = "pinvou3-tauri"
-version = "0.10.16"
+version = "0.10.17"
 description = "品悟智能助手桌面应用后端"
 authors = ["pinvou"]
 license = "MIT"
@@ -67,6 +67,7 @@ tokio = { version = "1.49", features = ["test-util"] }
 filetime = "0.2.29"
 
 [dependencies]
+pinvou-manual-update = { path = "src/features/updater/manual-update" }
 pinvou-upgrade-host = { path = "src/features/updater/host", optional = true }
 pinvou-upgrade-codec = { path = "src/features/updater/protocol/codec" }
 pinvou-upgrade-verifier = { path = "src/features/updater/protocol/verify" }
@@ -314,7 +315,7 @@ objc2-screen-capture-kit = { version = "0.3", default-features = false, features
 # desktop DC directly — xcap 0.9.8's capture_monitor leaks one GDI bitmap per
 # call (DeleteObject runs while the bitmap is still selected into the memory
 # DC) and its selection is never restored.
-windows-sys = { version = "0.61", features = ["Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Globalization", "Win32_Graphics_Gdi", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Performance", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61", features = ["Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Globalization", "Win32_Graphics_Gdi", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Performance", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
 webview2-com = "0.39"
 # Native Outlook .msg parsing (ingest_email.rs; same gating the retired
 # os::msg_native_supported() predicate provided). Windows-only compile:

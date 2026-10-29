@@ -1,5 +1,14 @@
 # Pinvou CodeWhale Fork Policy
 
+## Integration status: 2026-10-29
+
+The Windows manual-update candidate pins public review commit
+f83e8cd84dc52977e0f0cd219d65a301c44f5d6e (PR 129), with 88 commits above v0.9.12.
+Public maintenance is f1eb10efcfe2468fde42d1724d7f5f19d54b904c; the candidate is
+not yet aligned with it. Section 6 authorization and the strict public-head
+gate remain in force. Immutable tags are unchanged. The 2026-10-26 numbers
+below are the historical integrated checkpoint, not the current candidate.
+
 > Updated: 2026-10-26. Public maintenance 6e1ee88ee contains #118–#122; parent gitlink follows the public maintenance head.
 > Canonical Chinese policy: [`docs/fork-policy.md`](fork-policy.md). This English page is a condensed summary; the Chinese version is the complete, authoritative process.
 

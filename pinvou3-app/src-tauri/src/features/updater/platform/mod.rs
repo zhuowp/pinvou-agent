@@ -10,7 +10,22 @@ pub(super) fn show_startup_admission_failure(title: &str, message: &str) {
     eprintln!("{title}\n\n{message}");
 }
 
+pub use unsupported::cleanup_stale_backup;
+#[cfg(not(all(
+    target_os = "windows",
+    target_arch = "x86_64",
+    not(any(feature = "upgrade-host-lab", feature = "upgrade-host-production"))
+)))]
 pub use unsupported::{
-    check_for_update_info, cleanup_stale_backup, download_update_package,
-    install_downloaded_update, report_pending_update_result_info,
+    cancel_download, check_for_update_info, download_update_package, install_downloaded_update,
+    report_pending_update_result_info,
+};
+#[cfg(all(
+    target_os = "windows",
+    target_arch = "x86_64",
+    not(any(feature = "upgrade-host-lab", feature = "upgrade-host-production"))
+))]
+pub use windows::manual::{
+    cancel_download, check_for_update_info, download_update_package, install_downloaded_update,
+    report_pending_update_result_info,
 };

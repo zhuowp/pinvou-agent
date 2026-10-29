@@ -11,14 +11,11 @@ const updaterSource = fs.readFileSync(
   'utf8',
 );
 
-// Slim revival of the former updater_progress_state.test.mjs coverage: the
-// 200 ms progress-coalescing machinery it pinned was removed alongside the
-// `update:progress` event (the Rust backend never emitted it), but the
-// download/install state machine on the tauri updater domain still needs a
-// direct unit pin for its failure, cancel, and completion transitions.
 function loadUpdaterFeature(options = {}) {
   const root = { __PINVOU_TAURI_BRIDGE_FEATURES__: {} };
-  vm.runInNewContext(updaterSource, { window: root });
+  const context = vm.createContext({ window: root });
+  vm.runInContext(fs.readFileSync(path.join(here, '..', 'src/shared/bridge-shared-helpers.js'), 'utf8'), context);
+  vm.runInContext(updaterSource, context);
 
   const state = {
     updateProgress: 0,
@@ -26,14 +23,16 @@ function loadUpdaterFeature(options = {}) {
     updateCancelling: false,
     updateError: null,
     updateReady: false,
-    updateInfo: { available: true, platform: 'linux' },
+    updateInfo: { available: true, platform: 'windows', latest_version: '2.0.0', selection_id: 'candidate-1' },
     ...options.state,
   };
   const notifications = [];
   const invokeCalls = [];
+  const listeners = [];
   const factory = root.__PINVOU_TAURI_BRIDGE_FEATURES__.updater;
   const updater = factory({
     state,
+    listen(name, callback) { listeners.push({ name, callback }); return Promise.resolve(() => {}); },
     notify() {
       notifications.push(state.updateProgress);
     },
@@ -43,7 +42,7 @@ function loadUpdaterFeature(options = {}) {
     },
   });
 
-  return { updater, state, notifications, invokeCalls };
+  return { updater, state, notifications, invokeCalls, listeners };
 }
 
 function deferred() {
@@ -90,7 +89,7 @@ test('a failed download surfaces updateError and clears the downloading flag', a
     'a failed download must not restart the app');
 });
 
-test('a cancelled download resets progress without reporting an error', async () => {
+test('a cancelled download resets progress with a localized cancellation code', async () => {
   const downloadGate = deferred();
   const runtime = loadUpdaterFeature({
     invoke: (command) => {
@@ -114,44 +113,127 @@ test('a cancelled download resets progress without reporting an error', async ()
   const installed = await pending;
   assert.equal(installed, false);
   assert.equal(runtime.state.updateProgress, 0, 'a cancelled download must reset progress');
-  assert.equal(runtime.state.updateError, null, 'a user-initiated cancel is not an error');
+  assert.equal(runtime.state.updateError, 'UPDATER_DOWNLOAD_CANCELLED');
   assert.equal(runtime.state.updateDownloading, false);
   assert.equal(runtime.state.updateCancelling, false);
 });
 
-test('a completed download installs, marks ready, and restarts on non-windows platforms', async () => {
-  const runtime = loadUpdaterFeature({
-    state: { updateInfo: { available: true, platform: 'linux' } },
-  });
 
-  const installed = await runtime.updater.downloadAndInstallUpdate();
-
-  assert.equal(installed, true);
+const installer = { installer_path: 'C:/updates/pinvou-setup.exe' };
+test('download and install require separate actions; progress 100 never installs', async () => {
+  const gate = deferred();
+  const runtime = loadUpdaterFeature({ invoke: command => command === 'download_update' ? gate.promise : Promise.resolve(null) });
+  assert.equal(runtime.listeners.length, 1);
+  assert.equal(runtime.listeners[0].name, 'update:progress');
+  const pending = runtime.updater.downloadAndInstallUpdate();
+  await Promise.resolve();
+  runtime.listeners[0].callback({ payload: { downloaded: 10, total: 10, progress: 100 } });
   assert.equal(runtime.state.updateProgress, 100);
+  assert.equal(runtime.state.updateDownloading, true);
+  assert.equal(runtime.state.updateDownloaded, undefined);
+  assert.equal(await runtime.updater.downloadAndInstallUpdate(), false);
+  await runtime.updater.checkForUpdate();
+  assert.equal(runtime.invokeCalls.length, 1, 'busy blocks checking and repeated download');
+  gate.resolve(installer);
+  assert.equal(await pending, true);
+  assert.equal(runtime.state.updateDownloaded, true);
+  assert.equal(runtime.state.updateReady, false);
+  assert.equal(runtime.invokeCalls.length, 1, 'download completion never installs');
+  assert.equal(await runtime.updater.downloadAndInstallUpdate(), true);
   assert.equal(runtime.state.updateReady, true);
-  assert.equal(runtime.state.updateError, null);
-  assert.equal(runtime.state.updateDownloading, false);
-  const install = runtime.invokeCalls.find(call => call.command === 'install_update');
-  assert.ok(install, 'completion must run the install step');
-  assert.equal(install.args.debPath, null, 'a bare download result is forwarded as the deb path');
-  assert.ok(runtime.invokeCalls.some(call => call.command === 'restart_app'),
-    'linux and macos restart the frontend after install');
+  const call = runtime.invokeCalls.find(call => call.command === 'install_update');
+  assert.equal(call.args.installerPath, installer.installer_path);
+  assert.equal(call.args.info.selection_id, 'candidate-1');
+  assert.equal(runtime.invokeCalls.some(call => call.command === 'restart_app'), false);
+  assert.equal(runtime.listeners.length, 1);
 });
 
-test('a completed windows install starts no frontend restart', async () => {
-  const runtime = loadUpdaterFeature({
-    state: { updateInfo: { available: true, platform: 'windows' } },
-    invoke: (command) => command === 'download_update'
-      ? Promise.resolve({ installer_path: '/tmp/pinvou/update.msi' })
-      : Promise.resolve(null),
-  });
+test('UAC cancellation preserves verified candidate and retries install without another download', async () => {
+  let attempts = 0;
+  const gate = deferred();
+  const runtime = loadUpdaterFeature({ invoke(command) {
+    if (command === 'download_update') return Promise.resolve(installer);
+    if (command === 'install_update') return ++attempts === 1 ? Promise.reject('UPDATER_INSTALL_CANCELLED') : gate.promise;
+    return Promise.resolve();
+  } });
+  await runtime.updater.downloadAndInstallUpdate();
+  assert.equal(await runtime.updater.downloadAndInstallUpdate(), false);
+  assert.equal(runtime.state.updateDownloaded, true);
+  assert.equal(runtime.state.updateReady, false);
+  assert.equal(runtime.state.updateError, 'UPDATER_INSTALL_CANCELLED');
+  const pending = runtime.updater.downloadAndInstallUpdate();
+  assert.equal(runtime.state.updateInstalling, true);
+  assert.equal(await runtime.updater.downloadAndInstallUpdate(), false);
+  await runtime.updater.checkForUpdate();
+  gate.resolve(null);
+  assert.equal(await pending, true);
+  assert.equal(runtime.invokeCalls.filter(c => c.command === 'download_update').length, 1);
+});
 
-  const installed = await runtime.updater.downloadAndInstallUpdate();
+test('download captures metadata and rejects stale completion without overwriting new info', async () => {
+  const gate = deferred();
+  const runtime = loadUpdaterFeature({ invoke: () => gate.promise });
+  const pending = runtime.updater.downloadAndInstallUpdate();
+  await Promise.resolve();
+  runtime.state.updateInfo.latest_version = '3.0.0';
+  runtime.state.updateInfo.selection_id = 'candidate-2';
+  gate.resolve(installer);
+  assert.equal(await pending, false);
+  assert.equal(runtime.invokeCalls[0].args.info.latest_version, '2.0.0');
+  assert.equal(runtime.state.updateInfo.latest_version, '3.0.0');
+  assert.equal(runtime.state.updateDownloaded, false);
+  assert.equal(runtime.state.updateReady, false);
+});
 
-  assert.equal(installed, true);
-  const install = runtime.invokeCalls.find(call => call.command === 'install_update');
-  assert.equal(install.args.installerPath, '/tmp/pinvou/update.msi',
-    'a download result with installer_path must drive the installer channel');
-  assert.ok(!runtime.invokeCalls.some(call => call.command === 'restart_app'),
-    'windows exits through the launched installer instead of a frontend restart');
+test('new checked selection invalidates candidate even at the same version', async () => {
+  const runtime = loadUpdaterFeature({ invoke: command => Promise.resolve(command === 'download_update' ? installer : { available: true, platform: 'windows', latest_version: '2.0.0', selection_id: 'candidate-2' }) });
+  await runtime.updater.downloadAndInstallUpdate();
+  await runtime.updater.checkForUpdate();
+  assert.equal(runtime.state.updateDownloaded, false);
+  await runtime.updater.downloadAndInstallUpdate();
+  assert.equal(runtime.invokeCalls.filter(c => c.command === 'install_update').length, 0);
+  assert.equal(runtime.invokeCalls.filter(c => c.command === 'download_update').length, 2);
+});
+
+test('invalid download and failed install never report success', async () => {
+  const invalid = loadUpdaterFeature();
+  assert.equal(await invalid.updater.downloadAndInstallUpdate(), false);
+  assert.equal(invalid.state.updateError, 'UPDATER_DOWNLOAD_INVALID');
+  const failed = loadUpdaterFeature({ invoke: command => command === 'download_update' ? Promise.resolve(installer) : Promise.reject('UPDATER_INTEGRITY_FAILED') });
+  await failed.updater.downloadAndInstallUpdate();
+  assert.equal(await failed.updater.downloadAndInstallUpdate(), false);
+  assert.equal(failed.state.updateDownloaded, false);
+  assert.equal(failed.state.updateReady, false);
+});
+
+test('active tasks preserve candidate and the original info stays captured during installer launch', async () => {
+  let attempts = 0;
+  const gate = deferred();
+  const runtime = loadUpdaterFeature({ invoke(command) {
+    if (command === 'download_update') return Promise.resolve(installer);
+    return ++attempts === 1 ? Promise.reject('UPDATER_ACTIVE_TASKS') : gate.promise;
+  } });
+  await runtime.updater.downloadAndInstallUpdate();
+  assert.equal(await runtime.updater.downloadAndInstallUpdate(), false);
+  assert.equal(runtime.state.updateDownloaded, true);
+  const pending = runtime.updater.downloadAndInstallUpdate();
+  runtime.state.updateInfo = { available: true, latest_version: '9.0.0', platform: 'windows' };
+  gate.resolve(null);
+  assert.equal(await pending, true);
+  const installs = runtime.invokeCalls.filter(c => c.command === 'install_update');
+  assert.equal(installs[1].args.info.latest_version, '2.0.0');
+  assert.equal(installs[1].args.info.selection_id, 'candidate-1');
+});
+
+test('fixed backend cancellation without UI cancel is retryable and late progress is ignored', async () => {
+  let downloads = 0;
+  const runtime = loadUpdaterFeature({ invoke: () => ++downloads === 1 ? Promise.reject('UPDATER_DOWNLOAD_CANCELLED') : Promise.resolve(installer) });
+  assert.equal(await runtime.updater.downloadAndInstallUpdate(), false);
+  assert.equal(runtime.state.updateProgress, 0);
+  assert.equal(runtime.state.updateError, 'UPDATER_DOWNLOAD_CANCELLED');
+  assert.equal(await runtime.updater.downloadAndInstallUpdate(), true);
+  runtime.listeners[0].callback({ payload: { progress: 25 } });
+  assert.equal(runtime.state.updateProgress, 100);
+  assert.equal(runtime.state.updateDownloaded, true);
+  assert.equal(runtime.state.updateReady, false);
 });

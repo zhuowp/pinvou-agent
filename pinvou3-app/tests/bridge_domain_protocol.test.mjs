@@ -343,14 +343,9 @@ const expectedProtocolHashes = {
   // plugin registration and the prefs persistence; update_settings stays
   // untouched).
   settings: '981a53b39cce9c689425c458bdab7c73119e3e8e6c2298b9a5e3160d35380ef3',
-  // Recomputed for the dead-code cleanup: the never-emitted
-  // remote_control:status / remote_control:session_created listeners were
-  // removed, and the update:progress listener plus its coalescing timer
-  // machinery were deleted with it (the backend download loop no longer has a
-  // frontend progress consumer; completion still flips updateProgress to 100
-  // in downloadAndInstallUpdate). tests/updater_progress_state.test.mjs was
-  // removed along with the machinery it pinned.
-  updater: 'a59e86e937e5affd2ec0c36e2923c023713831197ef8a16f7a5104fbd6f460bf',
+  // Manual Windows updates restore update:progress and install only the captured
+  // verified candidate on a separate explicit confirmation action.
+  updater: '6d8fb27cb0aa4a7df037d652b9911bf156836e4ca64d522712343cf0c46e9c9b',
   // Recomputed for the comment-only English translation of the voice bridge
   // (PR-added Chinese comments inside the postprocess_voice_text invoke
   // span are part of the hashed source; no invoke/listen surface changed).

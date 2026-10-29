@@ -66,7 +66,7 @@
     personas: ["activePersona", "personaEvents", "personaPool"],
     memory: ["memory"],
     remoteControl: ["webAccess"],
-    updater: ["updateCancelling", "updateCheckError", "updateChecking", "updateDownloading", "updateError", "updateInfo", "updateProgress", "updateReady"],
+    updater: ["updateCancelling", "updateCheckError", "updateChecking", "updateDownloading", "updateDownloaded", "updateInstalling", "updateError", "updateInfo", "updateOutcome", "updateProgress", "updateReady"],
     dependencies: ["deps", "depsChecking", "depsInstallError", "depsInstallProgress", "depsInstalling"],
     projects: ["projectsList", "projectsAssignmentDegradedAt"],
   };
@@ -2177,14 +2177,11 @@
     return window.PinvouBridgeMessages.isInternalUserMessage(blocks);
   }
 
-  function isKnownInternalMetadataBlock(value) {
-    return window.PinvouBridgeMessages.isKnownInternalMetadataBlock(value);
-  }
-
   // web+tauriMain 共享（FE14 残余批：原 tauri bridge.js / web bridge.js 逐字镜像；
   // 信封判定直接取 window.PinvouBridgeMessages.isInternalRuntimeUserMessage——
   // 两侧原别名 isInternalRuntimeEnvelopeText / isInternalRuntimeUserMessage 同指此判定）
   // biome-ignore lint/suspicious/noFunctionAssign: forwarder-dep routing reassigns the shared impl when the lane passes its own (see FORWARDER_DEP_NAMES)
+  // eslint-disable-next-line no-unused-vars -- Preserve the existing caller signature and arity.
   function userMessageDisplayText(blocks, hideInternalEnvelope) {
     const textParts = window.PinvouBridgeMessages.visibleUserMessageBlocks(blocks)
       .filter(function (block) { return block && block.type === "text"; })
@@ -4374,16 +4371,18 @@
 
   // web+tauriUpdater 共享
   async function checkForUpdate() {
+    if (state.updateChecking || state.updateDownloading || state.updateInstalling) return;
+    state.updateError = null;
     state.updateChecking = true; state.updateCheckError = null; notify();
     try {
       const info = await invoke("check_for_update");
+      if (!info || typeof info.available !== "boolean") throw new Error("UPDATER_METADATA_INVALID");
       if (info && info.current_version) state.appVersion = info.current_version;
       state.updateInfo = info;
       if (!info.available) state.updateCheckError = "latest"; // 前端按 i18n 显示「已是最新」
     } catch (e) {
-      const unsupported = e === "UPDATER_CHECK_UNSUPPORTED" || e?.message === "UPDATER_CHECK_UNSUPPORTED";
-      state.updateCheckError = unsupported ? "UPDATER_CHECK_UNSUPPORTED" : String(e);
-      if (unsupported) state.updateInfo = null;
+      state.updateCheckError = e?.message || String(e);
+      state.updateInfo = null;
     }
     state.updateChecking = false; notify();
   }

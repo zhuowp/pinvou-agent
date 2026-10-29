@@ -1,5 +1,30 @@
 # Upgrade implementation progress
 
+2026-10-29 active delivery: **Windows x64 Stable manual-update MVP**. The user
+approved manual checking, full-installer download and a separate confirmation
+before the ordinary NSIS installer. See [delivery scope and publication
+procedure](windows-manual-updates.md). Full protocol, automatic installation,
+multi-user freezing, other platforms and complete certification are deferred.
+The historical 47-task completion estimates below remain separate.
+
+The candidate connects the existing UI and commands to a build-controlled HTTPS
+feed, backend-owned download receipts, exact size/SHA-256 verification and
+Windows native installer launch. Domain tests, focused bridge/UI tests,
+independent source review and the UI build have passed. The Windows default App
+library check passed with Rust 1.98.1; this metadata check does not link or certify
+an installer. Local NSIS packaging is pending because the MSVC linker and Windows
+SDK are unavailable. Runtime assets are still being materialized. No installer,
+Release asset or public feed has been published;
+native launch is not installation success or a Saved/drained acknowledgement.
+
+The fixed-weight MVP engineering estimate is **64.5%**. Check updates is 80%
+(weight 15), download and integrity verification 80% (20), UI and confirmation
+100% (10), Windows installer integration 70% (25), next-start observation 70%
+(10), and packaging/publication 10% (20). These are engineering estimates, not
+test coverage or release acceptance. The historical 47-task denominator below
+is unchanged. Each completed delivery phase reports both the total and these
+six subtask estimates.
+
 2026-10-29 T27 direct prerequisite: a
 [native initial check-scope owner](client-upgrade-native-check-scope.md) joins
 actual first-install protected storage and retained inspection.

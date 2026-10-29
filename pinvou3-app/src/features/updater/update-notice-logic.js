@@ -51,33 +51,27 @@
     const downloading = !!(bs && bs.updateDownloading);
     const ready = !!(bs && bs.updateReady);
     const progress = (bs && bs.updateProgress) || 0;
-    const isWindowsUpdate = info && info.platform === "windows";
-    const isMacUpdate = info && info.platform === "macos";
-    // macOS 安装是原地 bundle 替换(hdiutil attach + cp -R),后端返回 Ok(false)=安装完成
-    // 进程未退出。与 Linux 同型:app.restart() 按路径 exec,bundle 被替换后该路径已指向
-    // 新文件,tauri-bridge 自动触发 restartApp。三者都显示 ready=true 的"立即重启"按钮,
-    // 但 macOS/Linux 安装后由 tauri-bridge 自动重启,Windows 是 MSI 安装器接管(Ok(true)→exit)。
-    const restartAfterInstall = info && (info.platform === "linux" || isMacUpdate);
-    // 仅 Windows 启动外部 MSI 安装器(ready 时显示"安装器已启动",action=none)。
-    const installerLaunch = isWindowsUpdate;
+    const installing = !!(bs && bs.updateInstalling);
+    const downloaded = !!(bs && bs.updateDownloaded);
+    const checking = !!(bs && bs.updateChecking);
     const version = info.latest_version || info.current_version || fallbackVersion || "1.2.0";
-    const label = ready && installerLaunch
+    const label = ready
       ? text(labels, "updateInstallerStarted", "安装器已启动")
-      : ready
-      ? text(labels, "restartNow", "立即重启")
-      : (downloading
-        ? (progress >= 100 ? text(labels, "installing", "安装中...") : text(labels, "downloading", "下载中") + " " + progress + "%")
-        : (restartAfterInstall ? text(labels, "downloadInstallRestart", "升级并重启") : text(labels, "downloadInstall", "下载并安装")));
+      : installing ? text(labels, "installing", "安装中...")
+      : checking ? text(labels, "checking", "检查中…")
+      : downloading ? text(labels, "downloading", "下载中") + " " + progress + "%"
+      : downloaded ? text(labels, "updateInstallAndQuit", "安装并退出")
+      : text(labels, "updateDownload", "下载更新");
     return {
-      downloading,
+      downloading: downloading || installing,
+      downloaded,
       version,
       label,
-      action: ready ? (installerLaunch ? "none" : "restart") : (downloading ? "none" : "download"),
-      disabled: downloading || (ready && installerLaunch),
+      action: ready || downloading || installing || checking ? "none" : downloaded ? "install" : "download",
+      disabled: downloading || installing || checking || ready,
       // Localized hint only: the raw error may carry request details and be
-      // untranslated; it stays on bridge state, and the updater logs the raw
-      // cause for diagnostics.
-      error: bs && bs.updateError ? text(labels, "updateInstallFailed", "更新失败") : "",
+      // untranslated; it stays on bridge state for diagnostics.
+      error: bs && bs.updateError ? text(labels, "updateErrorMessage", text(labels, "updateInstallFailed", "更新失败")) : "",
     };
   }
 

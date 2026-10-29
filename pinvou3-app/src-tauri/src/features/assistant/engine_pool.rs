@@ -3813,6 +3813,26 @@ impl EnginePool {
 
     /// Whether this session currently has a turn in progress (for the
     /// frontend to restore the busy display after a remount).
+    /// Conservative nonblocking snapshot; no admission freeze is claimed.
+    pub(crate) fn has_active_work_for_update(&self) -> bool {
+        let Some(states) = self.turn_lifecycles.states.try_lock() else {
+            return true;
+        };
+        if states.values().any(|state| state.is_active()) {
+            return true;
+        }
+        let Some(scheduled) = self.scheduled_running_sessions.try_lock() else {
+            return true;
+        };
+        if !scheduled.is_empty() {
+            return true;
+        }
+        let Some(compacting) = self.compacting_sessions.try_lock() else {
+            return true;
+        };
+        !compacting.is_empty()
+    }
+
     pub fn is_turn_active(&self, session_id: &str) -> bool {
         self.turn_lifecycles
             .get(session_id)

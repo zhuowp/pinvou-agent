@@ -43,7 +43,7 @@ const vmIdle = logic.viewModel(
   { available: true, latest_version: '1.2.0', platform: 'linux' }
 );
 assert.strictEqual(vmIdle.version, '1.2.0');
-assert.strictEqual(vmIdle.label, '升级并重启');
+assert.strictEqual(vmIdle.label, '下载更新');
 assert.strictEqual(vmIdle.action, 'download');
 assert.strictEqual(vmIdle.disabled, false);
 
@@ -51,15 +51,15 @@ const vmWindowsIdle = logic.viewModel(
   { appVersion: '1.1.0' },
   { available: true, latest_version: '1.2.0', platform: 'windows' }
 );
-assert.strictEqual(vmWindowsIdle.label, '下载并安装');
+assert.strictEqual(vmWindowsIdle.label, '下载更新');
 
 const vmCustomLabels = logic.viewModel(
   { appVersion: '1.1.0' },
   { available: true, latest_version: '1.2.0', platform: 'linux' },
   null,
-  { downloadInstallRestart: 'Update & Restart' }
+  { updateDownload: 'Download update' }
 );
-assert.strictEqual(vmCustomLabels.label, 'Update & Restart');
+assert.strictEqual(vmCustomLabels.label, 'Download update');
 
 const vmDownloading = logic.viewModel(
   { updateDownloading: true, updateProgress: 42 },
@@ -73,16 +73,16 @@ const vmInstalling = logic.viewModel(
   { updateDownloading: true, updateProgress: 100 },
   { available: true, latest_version: '1.2.0' }
 );
-assert.strictEqual(vmInstalling.label, '安装中...');
+assert.strictEqual(vmInstalling.label, '下载中 100%');
 assert.strictEqual(vmInstalling.action, 'none');
 
 const vmReady = logic.viewModel(
   { updateReady: true },
   { available: true, latest_version: '1.2.0', platform: 'linux' }
 );
-assert.strictEqual(vmReady.label, '立即重启');
-assert.strictEqual(vmReady.action, 'restart');
-assert.strictEqual(vmReady.disabled, false);
+assert.strictEqual(vmReady.label, '安装器已启动');
+assert.strictEqual(vmReady.action, 'none');
+assert.strictEqual(vmReady.disabled, true);
 
 const vmWindowsReady = logic.viewModel(
   { updateReady: true },
@@ -92,24 +92,20 @@ assert.strictEqual(vmWindowsReady.label, '安装器已启动');
 assert.strictEqual(vmWindowsReady.action, 'none');
 assert.strictEqual(vmWindowsReady.disabled, true);
 
-// macOS 与 Linux 同型:后端 Ok(false) → 前端自动 restartApp(app.restart() 按路径 exec 新
-// bundle,inode 语义与 Linux 一致)。与 Windows 启动外部 MSI 安装器不同。因此 macOS ready
-// resolves through the restart branch (label=立即重启, action=restart, disabled=false).
+// Ready means installer launch, not installation completion.
 const vmMacReady = logic.viewModel(
   { updateReady: true },
   { available: true, latest_version: '1.2.0', platform: 'macos' }
 );
-assert.strictEqual(vmMacReady.label, '立即重启');
-assert.strictEqual(vmMacReady.action, 'restart');
-assert.strictEqual(vmMacReady.disabled, false);
+assert.strictEqual(vmMacReady.label, '安装器已启动');
+assert.strictEqual(vmMacReady.action, 'none');
+assert.strictEqual(vmMacReady.disabled, true);
 
-// macOS idle 态:restartAfterInstall=true(mac 与 linux 同型),idle 应走"升级并重启"
-// 而非"下载并安装"(后者是 Windows/无 restartAfterInstall 的默认)。
 const vmMacIdle = logic.viewModel(
   { appVersion: '1.1.0' },
   { available: true, latest_version: '1.2.0', platform: 'macos' }
 );
-assert.strictEqual(vmMacIdle.label, '升级并重启');
+assert.strictEqual(vmMacIdle.label, '下载更新');
 assert.strictEqual(vmMacIdle.action, 'download');
 assert.strictEqual(vmMacIdle.disabled, false);
 
@@ -132,17 +128,23 @@ assert.strictEqual(
   'labels without the key fall back to the default hint, never the raw error'
 );
 
-// unknown platform falls back to download-and-install (no auto-restart):
-// only linux/macos support auto-restart (see update-notice-logic.js), so an
-// unknown platform (e.g. a future freebsd) must not assume it can restart:
-// the idle state resolves to download-and-install rather than
-// upgrade-and-restart (action='download', not 'restart').
+// The manual download action never promises an automatic restart.
 const vmUnknownIdle = logic.viewModel(
   { appVersion: '1.1.0' },
   { available: true, latest_version: '1.2.0', platform: 'freebsd' }
 );
-assert.strictEqual(vmUnknownIdle.label, '下载并安装');
+assert.strictEqual(vmUnknownIdle.label, '下载更新');
 assert.strictEqual(vmUnknownIdle.action, 'download');
 assert.strictEqual(vmUnknownIdle.disabled, false);
 
 console.log('update_notice_logic: ok');
+
+const downloaded = logic.viewModel({ updateDownloaded: true }, { available: true, platform: 'windows' }, '', { updateInstallAndQuit: 'Install and quit' });
+assert.strictEqual(downloaded.action, 'install');
+assert.strictEqual(downloaded.label, 'Install and quit');
+assert.strictEqual(downloaded.disabled, false);
+const installing = logic.viewModel({ updateDownloaded: true, updateInstalling: true }, { available: true, platform: 'windows' });
+assert.strictEqual(installing.action, 'none');
+assert.strictEqual(installing.disabled, true);
+const checking = logic.viewModel({ updateChecking: true }, { available: true, platform: 'windows' });
+assert.strictEqual(checking.disabled, true);

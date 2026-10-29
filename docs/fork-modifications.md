@@ -1,5 +1,24 @@
 # CodeWhale Fork 修改清单
 
+## Windows manual-update build candidate
+
+- The parent candidate pins public commit f83e8cd84dc52977e0f0cd219d65a301c44f5d6e
+  from [CodeWhale PR 129](https://github.com/Pinvou/CodeWhale/pull/129), based on
+  current maintenance f1eb10efcfe2468fde42d1724d7f5f19d54b904c. This is a review
+  candidate, not a claim that protected maintenance or an immutable tag advanced.
+- The default Windows GNU LLVM build selects the existing rquickjs bindgen
+  feature. The separate generic engine-run completion API observes the exact
+  spawned future; it does not certify saving, writer drain or native authority.
+  Upstream contributions are Codewhale PRs 7138 and 7139.
+- This also includes the already published maintenance changes since the old
+  parent pin: PR 114 partial-input reuse and PR 125 skill-discovery guidance.
+  There are 88 commits above v0.9.12 at this candidate; cumulative drift is
+  528 files, +91844/-39246. The existing long-term theme contracts remain.
+- Clean locked-source x64 Windows GNU LLVM validation passed workflow-js and
+  TUI library checks, 73 existing VM tests, and 12 run-completion tests (11 new
+  plus one existing). Those are component results, not full App or release
+  qualification. The separate public-maintenance alignment gate stays strict.
+
 ## 已合入维护分支：压缩检查点角色兼容性
 
 - T7：将带类型的 Agent 拓扑检查点放到最近一次真实用户输入之后、该轮 assistant/tool 链之前，包括压缩摘要位于链尾的情况。Chat Completions 发送前把结构化识别的当前格式摘要移到其保留轮次之前，并把该摘要与拓扑检查点合并进这条 user 出站消息；普通用户引用摘要标记不会触发重排。修复范围是压缩流程自身产生的尾部 `tool -> user`，客户报错原文为 `SSE stream request failed: HTTP 400 Bad Request: response_role: "user"`（SSE 载体）；存储历史及工具调用/结果 ID 不变，会话固定的系统前缀也不变。
