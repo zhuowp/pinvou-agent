@@ -17,12 +17,7 @@ function pinvouSharedtauriUpdater() {
   const state = context.state;
   const notify = context.notify;
   const invoke = context.invoke;
-  // ── 应用内升级 ───────────────────────────────────────────────────
-  // The community backend currently reports update checking and installation
-  // as unsupported. This bridge preserves the existing action interfaces for
-  // a future implementation; it does not establish update availability.
-  // Local diagnostics are independent of check/download/install. In-flight
-  // invokes are shared across mounts; no automatic refresh or network retry.
+  // Manual updates and independent local trusted-time diagnostics.
   let timeStatusPending = null;
   let timeRefreshPending = null;
   function inspectTrustedTime() {
@@ -54,62 +49,121 @@ function pinvouSharedtauriUpdater() {
       state.appVersion = await invoke("get_app_version");
     } catch { /* leaving the version empty on read failure is fine */ }
   }
-  // 启动静默检查: 失败全吞(网络差/更新源挂了不打扰用户)。结果不管新旧都存——
-  // available 驱动红点,current_version 给设置页显示当前版本用。
-  async function checkForUpdateSilently() {
-    try {
-      const info = await invoke("check_for_update");
-      if (info && info.current_version) state.appVersion = info.current_version;
-      if (info) { state.updateInfo = info; notify(); }
-    } catch { /* 静默 */ }
+  // Startup performs a local version read only.
+  async function checkForUpdateSilently() { await loadAppVersion(); }
+  let downloadedCandidate = null;
+  function infoKey(info) {
+    return JSON.stringify(info, info ? Object.keys(info).sort((left, right) => left < right ? -1 : left > right ? 1 : 0) : undefined);
   }
-  // 设置页手动检查: 错误和「已是最新」都要反馈。
-async function checkForUpdate() { return pinvouSharedtauriUpdater().checkForUpdate(); }
-  // 下载+安装一条龙: Linux 下载 deb 后 pkexec apt 并自动重启;Windows 下载 zip 后解析 MSI,
-  // 安装器启动成功后 Windows 退出当前进程；Linux/macOS 在安装后由前端重启。
+  function clearCandidate() {
+    downloadedCandidate = null;
+    state.updateDownloaded = false;
+    state.updateReady = false;
+    state.updateProgress = 0;
+  }
+  function busy() {
+    return state.updateChecking || state.updateDownloading || state.updateInstalling;
+  }
+  function discardStaleCandidate() {
+    if (downloadedCandidate && infoKey(state.updateInfo) !== infoKey(downloadedCandidate.info)) clearCandidate();
+  }
+  async function checkForUpdate() {
+    if (busy() || state.updateReady) return false;
+    await pinvouSharedtauriUpdater().checkForUpdate();
+    discardStaleCandidate();
+    notify();
+  }
+
+  // Installed once with the bridge feature, never per React mount or click.
+  const progressListener = context.listen
+    ? Promise.resolve(context.listen("update:progress", function (event) {
+      if (!state.updateDownloading || state.updateCancelling) return;
+      const progress = Number(event && event.payload && event.payload.progress);
+      if (!Number.isFinite(progress)) return;
+      state.updateProgress = Math.max(state.updateProgress, Math.min(100, Math.max(0, progress)));
+      notify();
+    }))
+    : Promise.resolve();
+  progressListener.catch(function () {});
+
+  // First click downloads; a separate click confirms installation and quitting.
+  // The verified path and captured metadata stay private to this bridge instance.
   async function downloadAndInstallUpdate() {
-    if (!state.updateInfo || !state.updateInfo.available || state.updateDownloading) return false;
-    // 入口捕获发起时的更新信息：下载/安装期间静默检查可能替换 updateInfo，
-    // download/install 参数须仍指向发起时的版本（审计）。当前基线的 install_update
-    // 为 unsupported 桩（info 未参与行为），此配对为面向完整平台实现的防御性修复。
-    // invoke 文本保持原样。
-    const info = state.updateInfo;
-    const shouldRestartAfterInstall = info.platform !== "windows";
-    let installed = false;
-    state.updateDownloading = true; state.updateCancelling = false;
-    state.updateProgress = 0; state.updateError = null; notify();
-    try {
-      const downloadResult = await invoke("download_update", { info: state.updateInfo });
-      state.updateProgress = 100; notify();
-      state.updateInfo = info; // 复原：install 用发起时的版本元数据，不随静默检查漂移
-      if (downloadResult && typeof downloadResult === "object" && downloadResult.installer_path) {
-        await invoke("install_update", { installerPath: downloadResult.installer_path, info: state.updateInfo });
-      } else {
-        await invoke("install_update", { debPath: downloadResult, info: state.updateInfo });
+    if (busy() || state.updateReady) return false;
+    discardStaleCandidate();
+    if (!state.updateInfo || !state.updateInfo.available) return false;
+    state.updateError = null;
+    if (downloadedCandidate) {
+      const candidate = downloadedCandidate;
+      state.updateInstalling = true;
+      notify();
+      try {
+        await invoke("install_update", { installerPath: candidate.installerPath, info: candidate.info });
+        // The installer started; the next startup checks the actual outcome.
+        state.updateReady = true;
+        return true;
+      } catch (error) {
+        state.updateError = error && error.message || String(error);
+        // UAC cancellation leaves the verified candidate available for retry.
+        if (!["UPDATER_INSTALL_CANCELLED", "UPDATER_BUSY", "UPDATER_ACTIVE_TASKS"].includes(state.updateError)) clearCandidate();
+        return false;
+      } finally {
+        state.updateInstalling = false;
+        notify();
       }
-      state.updateReady = true;
-      installed = true;
-    } catch (e) {
-      // 用户主动取消下载时后端返回「已取消下载」,当正常处理不弹错误
-      if (state.updateCancelling) state.updateProgress = 0;
-      else state.updateError = String(e);
     }
-    state.updateDownloading = false; state.updateCancelling = false; notify();
-    if (installed && shouldRestartAfterInstall) restartApp();
-    return installed;
+    const info = JSON.parse(JSON.stringify(state.updateInfo));
+    state.updateDownloading = true;
+    state.updateCancelling = false;
+    state.updateProgress = 0;
+    notify();
+    try {
+      await progressListener;
+      const result = await invoke("download_update", { info });
+      if (state.updateCancelling) {
+        state.updateError = "UPDATER_DOWNLOAD_CANCELLED";
+        state.updateProgress = 0;
+        return false;
+      }
+      if (infoKey(state.updateInfo) !== infoKey(info)) {
+        clearCandidate();
+        return false;
+      }
+      if (!result || typeof result.installer_path !== "string" || !result.installer_path) throw new Error("UPDATER_DOWNLOAD_INVALID");
+      downloadedCandidate = { info, installerPath: result.installer_path };
+      state.updateDownloaded = true;
+      state.updateProgress = 100;
+      return true;
+    } catch (error) {
+      clearCandidate();
+      state.updateError = state.updateCancelling ? "UPDATER_DOWNLOAD_CANCELLED" : error && error.message || String(error);
+      return false;
+    } finally {
+      state.updateDownloading = false;
+      state.updateCancelling = false;
+      notify();
+    }
   }
-  // 取消进行中的下载: 置前端标志 + 通知后端中断下载循环。仅下载阶段有效;
-  // 已进入 install(pkexec/apt)则无效(系统接管,装一半不能停)。
   function cancelUpdate() {
     if (!state.updateDownloading || state.updateCancelling) return;
-    state.updateCancelling = true; notify();
-    invoke("cancel_download").catch(function () { /* 忽略,下载循环超时也会退 */ });
+    state.updateCancelling = true;
+    notify();
+    invoke("cancel_download").catch(function () {});
   }
   function restartApp() {
     invoke("restart_app").catch(function () { /* restart 成功不会返回 */ });
   }
-  function reportPendingUpdateResult() {
-    invoke("report_pending_update_result").catch(function () { /* 静默重试,不阻塞启动 */ });
+  async function reportPendingUpdateResult() {
+    let outcome = null;
+    try {
+      const reply = await invoke("report_pending_update_result");
+      // This observes the running version locally; it is not installer completion.
+      if (reply && reply.had_pending === true && ["version_now_target", "unknown"].includes(reply.result)) {
+        outcome = reply.result;
+      }
+    } catch { /* Keep the local observation absent when the backend cannot read it. */ }
+    state.updateOutcome = outcome;
+    notify();
   }
 
     return {

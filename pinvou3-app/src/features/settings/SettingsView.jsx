@@ -22,7 +22,7 @@ import {
 import { CommunityPanel } from './CommunityPanel.jsx';
 import { COMMUNITY_DISCUSSIONS_URL } from './community-config.js';
 import { ProvidersSection } from './ProvidersSection.jsx';
-import { updateErrorCopy } from './update-check-copy.js';
+import { updateErrorCopy, updateOutcomeCopy } from './update-check-copy.js';
 import {
   VOICE_POSTPROCESS_ENABLED_KEY,
   VOICE_SHORTCUT_ENABLED_KEY,
@@ -2677,33 +2677,29 @@ function hasStoredCredential(record) {
         const updateDownloading = !!(bs && bs.updateDownloading);
         const updateCancelling = !!(bs && bs.updateCancelling);
         const updateReady = !!(bs && bs.updateReady);
+        const updateDownloaded = !!(bs && bs.updateDownloaded);
+        const updateInstalling = !!(bs && bs.updateInstalling);
         const updateProgress = (bs && bs.updateProgress) || 0;
-        const isWindowsUpdate = upd && upd.platform === 'windows';
         // The localized hint replaces the raw backend string (it may carry request
-        // details and be untranslated); the raw cause stays in bridge state and
-        // is logged by the updater for diagnostics.
+        // details and be untranslated); the raw cause stays in bridge state.
         const updateError = updateErrorCopy(bs, t);
-        const updateStatusDesc = updateDownloading
-          ? (updateProgress >= 100 ? t.uiSettings.installingUpdate : t.uiSettings.downloading(updateProgress))
-          : updateReady
-            ? (isWindowsUpdate ? t.updateInstallerStarted : t.updateComplete)
-            : (upd && upd.available ? `v${upd.latest_version}` : (bs && bs.updateCheckError === 'latest' ? t.upToDate : ''));
-        const updateButtonLabel = updateChecking
-          ? t.checking
-          : updateDownloading
-            ? (updateProgress >= 100 ? t.installing : (updateCancelling ? t.cancelling : t.uiSettings.cancelDownload))
-            : updateReady
-              ? (isWindowsUpdate ? t.uiSettings.installerStarted : t.restartNow)
-              : (upd && upd.available ? (upd.platform === 'linux' ? t.downloadInstallRestart : t.downloadInstall) : t.checkUpdate);
-        const updateButtonDisabled = !bridge.available || updateChecking || updateCancelling || (updateDownloading && updateProgress >= 100) || (updateReady && isWindowsUpdate);
+        const updateOutcome = updateOutcomeCopy(bs, t);
+        const updateStatusDesc = updateInstalling ? t.installing
+          : updateDownloading ? t.uiSettings.downloading(updateProgress)
+          : updateReady ? t.updateInstallerStarted
+          : updateDownloaded ? t.updateDownloadedHint
+          : (upd && upd.available ? `v${upd.latest_version}` : (bs && bs.updateCheckError === 'latest' ? t.upToDate : ''));
+        const updateButtonLabel = updateChecking ? t.checking
+          : updateInstalling ? t.installing
+          : updateDownloading ? (updateCancelling ? t.cancelling : t.uiSettings.cancelDownload)
+          : updateReady ? t.updateInstallerStarted
+          : updateDownloaded ? t.updateInstallAndQuit
+          : (upd && upd.available ? t.updateDownload : t.checkUpdate);
+        const updateButtonDisabled = !bridge.available || updateChecking || updateInstalling || updateCancelling || updateReady;
         const handleUpdateAction = () => {
-          if (!bridge.available || updateChecking) return;
+          if (!bridge.available || updateChecking || updateInstalling || updateReady) return;
           if (updateDownloading) {
-            if (updateProgress < 100 && !updateCancelling) bridge.updater.cancelUpdate();
-            return;
-          }
-          if (updateReady) {
-            if (!isWindowsUpdate) bridge.updater.restartApp();
+            if (!updateCancelling) bridge.updater.cancelUpdate();
             return;
           }
           if (upd && upd.available) bridge.updater.downloadAndInstallUpdate();
@@ -2719,6 +2715,9 @@ function hasStoredCredential(record) {
                     <button type="button" data-settings-update-action="true" onClick={handleUpdateAction} disabled={updateButtonDisabled} className="h-9 px-4 rounded-full bg-[#007AFF] text-white text-[14px] font-semibold whitespace-nowrap disabled:opacity-50 disabled:cursor-not-allowed">{updateButtonLabel}</button>
                   </IOSRow>
                 </IOSSection>
+                {updateOutcome && (
+                  <div data-settings-update-outcome="true" className="px-3 -mt-3 mb-4 text-[12px] leading-5 text-[#8A8A8E] dark:text-[#8E8E93]">{updateOutcome}</div>
+                )}
                 {updateError && (
                   <div className="px-3 -mt-3 mb-4 text-[12px] leading-5 text-[#EA4335] break-words">{String(updateError)}</div>
                 )}

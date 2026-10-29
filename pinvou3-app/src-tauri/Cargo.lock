@@ -6696,7 +6696,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pinvou-knowledge"
-version = "0.10.16"
+version = "0.10.17"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -6718,6 +6718,19 @@ dependencies = [
  "tempfile",
  "tokio",
  "url",
+]
+
+[[package]]
+name = "pinvou-manual-update"
+version = "0.1.0"
+dependencies = [
+ "reqwest 0.13.5",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -6873,7 +6886,7 @@ dependencies = [
 
 [[package]]
 name = "pinvou3-tauri"
-version = "0.10.16"
+version = "0.10.17"
 dependencies = [
  "age",
  "agent-backend-api",
@@ -6915,6 +6928,7 @@ dependencies = [
  "objc2-web-kit",
  "parking_lot",
  "pinvou-knowledge",
+ "pinvou-manual-update",
  "pinvou-upgrade-archive",
  "pinvou-upgrade-byte-check",
  "pinvou-upgrade-cache-object",

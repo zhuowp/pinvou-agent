@@ -331,7 +331,10 @@ function renderMarkdown(text) { return pinvouSharedtauriMain().renderMarkdown(te
     updateCheckError: null,   // 手动检查的错误/「已是最新」提示文案
     updateDownloading: false,
     updateProgress: 0,        // 0-100
-    updateReady: false,       // 安装完成,等用户点重启
+    updateOutcome: null,      // Local observation from the previous installer handoff
+    updateDownloaded: false,  // Verified download awaiting user confirmation
+    updateInstalling: false,
+    updateReady: false,       // Installer launched; result checked at next startup
     updateError: null,        // 下载/安装阶段错误(sha256/apt stderr 透传)
     updateCancelling: false,  // 用户点了取消,据此把后端「已取消下载」当正常而非错误
     // 依赖体检(设置页): deps = [{key, installed, apt}], null = 尚未检测
@@ -1972,7 +1975,7 @@ function composePlanMarkdown(snapshots) { return pinvouSharedtauriMain().compose
   const setRemoteCollectionEnabled = personasFeature.setRemoteCollectionEnabled;
   const removeRemoteCollection = personasFeature.removeRemoteCollection;
   const syncMountedCollection = personasFeature.syncMountedCollection;
-  const updaterFeature = installBridgeFeature("updater", { state, notify, invoke });
+  const updaterFeature = installBridgeFeature("updater", { state, notify, invoke, listen });
   const loadAppVersion = updaterFeature.loadAppVersion;
   const inspectTrustedTime = updaterFeature.inspectTrustedTime;
   const requestTrustedTimeRefresh = updaterFeature.requestTrustedTimeRefresh;

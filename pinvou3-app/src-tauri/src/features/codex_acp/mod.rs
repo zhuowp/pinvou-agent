@@ -1995,6 +1995,23 @@ impl AcpPool {
     /// across the call — the rebind fences go through
     /// [`Self::rebind_blocking_sessions`] instead (review #463 round-10
     /// T13/T16).
+    /// Fail closed on contention; this snapshot never stops active processes.
+    pub(crate) async fn has_active_work_for_update(&self) -> bool {
+        let Ok(sessions) = self.sessions.try_lock() else {
+            return true;
+        };
+        let Some(installs) = self.install_active.try_read() else {
+            return true;
+        };
+        sessions.values().any(|runtime| {
+            rebind_busy_flags(
+                runtime.busy.load(Ordering::Acquire),
+                runtime.configuring.load(Ordering::Acquire),
+                runtime.prompt_pending.load(Ordering::Acquire) > 0,
+            )
+        }) || !installs.is_empty()
+    }
+
     pub async fn is_turn_active(&self, session_id: &str) -> bool {
         self.sessions
             .lock()

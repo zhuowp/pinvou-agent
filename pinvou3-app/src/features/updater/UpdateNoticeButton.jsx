@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { PinvouLogo } from '../../components/PinvouLogo.jsx';
 import { RefreshCw, X } from '../../components/icons.jsx';
+import { updateErrorCopy } from '../settings/update-check-copy.js';
 import { bridge } from '../../hooks/useBridge.js';
 
 // Card bottom edge sits at 16px; `bottomInset` raises it above full-height
@@ -99,11 +100,12 @@ export const UpdateNoticeButton = ({ bs, t, onShowChangelog, sidebarOffset = 0, 
   if (hidden || !logic || !updateInfo || closed) return null;
 
   const vm = logic.viewModel(bs, updateInfo, bs && bs.appVersion, {
-    downloadInstall: t.downloadInstall,
-    downloadInstallRestart: t.downloadInstallRestart,
+    updateDownload: t.updateDownload,
+    updateInstallAndQuit: t.updateInstallAndQuit,
+    checking: t.checking,
+    updateErrorMessage: updateErrorCopy(bs, t),
     downloading: t.downloading,
     installing: t.installing,
-    restartNow: t.restartNow,
     updateInstallerStarted: t.updateInstallerStarted,
     updateInstallFailed: t.updateInstallFailed,
   });
@@ -113,8 +115,7 @@ export const UpdateNoticeButton = ({ bs, t, onShowChangelog, sidebarOffset = 0, 
       return;
     }
     if (!bridge.available) return;
-    if (vm.action === 'restart') bridge.updater.restartApp();
-    else if (vm.action === 'download') bridge.updater.downloadAndInstallUpdate();
+    if (vm.action === 'download' || vm.action === 'install') bridge.updater.downloadAndInstallUpdate();
   };
 
   const handleShowChangelog = () => {
@@ -149,6 +150,10 @@ export const UpdateNoticeButton = ({ bs, t, onShowChangelog, sidebarOffset = 0, 
           <span className={`text-[11px] font-mono px-1.5 py-0.5 rounded w-fit mt-0.5 transition-colors duration-300 text-gray-500 bg-gray-100 dark:text-gray-400 dark:bg-black/20`}>PINVOU v{vm.version}</span>
         </div>
       </div>
+
+      {vm.downloaded && !bs?.updateReady && (
+        <div className="mb-3 text-[11px] leading-relaxed">{t.updateDownloadedHint}</div>
+      )}
 
       {vm.error && (
         <div className="mb-3 text-[11px] leading-relaxed text-[#EA4335] break-words">{vm.error}</div>

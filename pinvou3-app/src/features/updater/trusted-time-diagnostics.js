@@ -127,6 +127,10 @@ export function createTrustedTimeDiagnostics(adapter, publish) {
   return {
     read: () => run(false),
     refresh: () => run(true),
-    dispose: () => { disposed = true; if (timer !== null) clearTimeout(timer); timer = null; },
+    dispose: () => {
+      disposed = true;
+      if (timer !== null) { clearTimeout(timer); }
+      timer = null;
+    },
   };
 }

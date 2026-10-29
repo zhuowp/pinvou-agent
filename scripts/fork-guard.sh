@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# CodeWhale v0.9.12 clean re-fork guard: 84 maintenance commits, ten maintained themes (r3 closed at pinvou-v0.9.12-r3; inside a transition window the head may lead the tag).
+# CodeWhale v0.9.12 guard: 88 review-candidate commits; public maintenance is checked separately.
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CODEWHALE="$REPO/CodeWhale"
 APP="$REPO/pinvou3-app/src-tauri"
 EXPECTED_UPSTREAM="dcd4c200f72f0c1ffd60d8e7f6850313db879fc5"
-# Public maintenance after CodeWhale#118–#122 merged.
-EXPECTED_HEAD="6e1ee88ee8f8ea28eec7be3d8add3a591468412a"
-EXPECTED_COMMITS=84
+# Public review candidate; protected maintenance alignment is checked separately.
+EXPECTED_HEAD="f83e8cd84dc52977e0f0cd219d65a301c44f5d6e"
+EXPECTED_COMMITS=88
 # Published maintenance base of this integration.
-MAINTENANCE_BASE="6e1ee88ee8f8ea28eec7be3d8add3a591468412a"
+MAINTENANCE_BASE="f1eb10efcfe2468fde42d1724d7f5f19d54b904c"
 # The immutable r1 closure must remain an ancestor of the registered head.
 # A review candidate may lead public maintenance; this does not waive the
 # separate public-head gate or change the immutable r3 transition baseline.
@@ -70,6 +70,9 @@ fi
 bold "── 第 1 层：登记主题与父仓适配指纹 ──"
 # 格式：主题|说明|文件（相对父仓根）|grep -F 固定串
 fingerprints=(
+  "UPSTREAM|GNU LLVM binding generation|CodeWhale/crates/workflow-js/Cargo.toml|target_abi = \"llvm\""
+  "UPSTREAM|Exact spawned-run completion|CodeWhale/crates/tui/src/core/engine/handle.rs|pub async fn wait_run_completion"
+  "UPSTREAM|Run completion and constructor behavior|CodeWhale/crates/tui/src/core/engine/tests.rs|fn run_completion_real_factories_observe_shutdown_and_direct_handles_do_not"
   "T2|Test metadata summary loss requests recovery|CodeWhale/crates/tui/src/core/engine/tests.rs|fn forkguard_run_tests_metadata_summary_cut_requests_recovery"
   "T2|Child report artifact retains exact bytes and ids|CodeWhale/crates/tui/src/tools/subagent/tests.rs|fn forkguard_subagent_report_artifact_keeps_exact_bytes"
   "T2|Deferred subagent report names explicit activation fallback|CodeWhale/crates/tui/src/tools/subagent/tests.rs|fn stamp_subagent_summary_truncates_when_over_budget"
@@ -197,14 +200,14 @@ fingerprints=(
   "T3|静态 prompt composer              |CodeWhale/crates/tui/src/prompts.rs|pub fn set_static_prompt_composer_override("
   "T3|ambient project authority 密封     |CodeWhale/crates/tui/src/project_context.rs|forkguard_runtime_loader_ignores_ambient_project_authority"
   "T3|显式 Skills 根排除 ambient 来源    |CodeWhale/crates/tui/src/skills/tests.rs|forkguard_explicit_skills_dir_excludes_ambient_workspace_sources"
-  "T3|技能索引 Usage 补 tool_search 激活兜底|CodeWhale/crates/tui/src/skills/mod.rs|activate it via \`tool_search\`; if it is still missing"
+  "T3|技能索引 Usage 补 tool_search 激活兜底|CodeWhale/crates/tui/src/skills/mod.rs|activate it via \`tool_search\` if available."
   "T3|技能索引 Usage 回归                 |CodeWhale/crates/tui/src/skills/tests.rs|fn forkguard_skill_index_usage_names_tool_search_activation"
-  "T3|子代理技能段走 tool_search 发现        |CodeWhale/crates/tui/src/tools/subagent/mod.rs|activating it via \`tool_search\` first if it is not in your tool list"
+  "T3|子代理技能段走 tool_search 发现        |CodeWhale/crates/tui/src/tools/subagent/mod.rs|Load an applicable Skill with \`load_skill\` before use."
   "T3|子代理技能目录回归                  |CodeWhale/crates/tui/src/tools/subagent/tests.rs|fn forkguard_subagent_skill_catalog_uses_tool_search_discovery"
-  "T3|发现技能幻影命令自条件             |CodeWhale/crates/tui/assets/skills/mcp-discovery/SKILL.md|MCP Registry access is unavailable in"
+  "T3|发现技能幻影命令自条件             |CodeWhale/crates/tui/assets/skills/mcp-discovery/SKILL.md|If unavailable or denied, explain"
   "T3|registry-first 指令与注册名互钉       |CodeWhale/crates/tui/src/core/engine/tests.rs|fn forkguard_registry_first_instruction_names_registered_tool_specs"
   "T3|mcp-discovery 命令自条件回归        |CodeWhale/crates/tui/src/skills/tests.rs|fn forkguard_mcp_discovery_skill_conditions_registry_commands"
-  "T3|tool_search 缺失态诚实兜底          |CodeWhale/crates/tui/src/skills/mod.rs|continue without skills only if that call also fails"
+  "T3|tool_search 缺失态诚实兜底          |CodeWhale/crates/tui/src/skills/mod.rs|stop and report the limitation"
   "T3|目标续轮点名 tool_search 激活       |CodeWhale/crates/tui/src/core/engine/tests.rs|fn forkguard_goal_continuation_names_tool_search_activation"
   "T3|技能索引省略尾行守护               |CodeWhale/crates/tui/src/skills/tests.rs|fn forkguard_omitted_skills_line_stays_short"
   "T3|捆绑技能退役名清扫回归             |CodeWhale/crates/tui/src/skills/system/tests.rs|fn forkguard_bundled_skills_cite_no_hidden_or_retired_tool_names"
@@ -215,16 +218,16 @@ fingerprints=(
   "T3|pdf 技能改引 bash 侧活工具         |CodeWhale/crates/tui/assets/skills/pdf/SKILL.md|\`pdftotext\` for text extraction"
   "T3|best-of-n 目标门控文案             |CodeWhale/crates/tui/assets/skills/best-of-n/SKILL.md|\`create_goal\` is in your tool list"
   "T3|mcp-discovery 前言如实披露 pool 依赖 |CodeWhale/crates/tui/assets/skills/mcp-discovery/SKILL.md|the start tool once the host's MCP pool is initialized"
-  "T3|start 工具两段式激活门控           |CodeWhale/crates/tui/assets/skills/mcp-discovery/SKILL.md|\`tool_search\` as in step 1; if that fails, registry starts"
+  "T3|start 工具两段式激活门控           |CodeWhale/crates/tui/assets/skills/mcp-discovery/SKILL.md|\`tool_search\` when available, as in step 1."
   "T3|best-of-n 补 tool_search 激活路径    |CodeWhale/crates/tui/assets/skills/best-of-n/SKILL.md|if it is not, run \`tool_search\` first"
   "T3|父上下文提示只点名活工具          |CodeWhale/crates/tui/src/core/engine/context.rs|verify side effects with \`read\` or \`bash\`"
   "T3|Permissions 窄 100 KiB 预算       |CodeWhale/crates/tui/src/prompts.rs|forkguard_instruction_fragment_preserves_explicit_host_budget"
   "T3|内部 reminder 不污染 working set  |CodeWhale/crates/tui/src/working_set.rs|forkguard_working_set_ignores_leading_system_reminder_paths"
-  "T3|registry-first 指令补激活路径        |CodeWhale/crates/tui/src/core/engine.rs|run \`tool_search\` first to activate it; if it cannot be surfaced"
-  "T3|start 工具独立激活披露             |CodeWhale/crates/tui/src/core/engine.rs|activate it via \`tool_search\` as well, since activating \`registry_sync\` does not activate it"
+  "T3|registry-first 指令补激活路径        |CodeWhale/crates/tui/src/core/engine.rs|run \`tool_search\` first to activate it when available;"
+  "T3|start 工具独立激活披露             |CodeWhale/crates/tui/src/core/engine.rs|one direct call to \`start_registry_mcp_server\` may surface its schema"
   "T3|sync 结果提示补 start 激活          |CodeWhale/crates/tui/src/tools/mcp_registry.rs|run tool_search first to activate it"
   "T3|sync 结果提示激活回归               |CodeWhale/crates/tui/src/tools/mcp_registry.rs|fn forkguard_registry_first_prompt_teaches_start_tool_activation"
-  "T3|worker 记录共享 handle_read 激活提示 |CodeWhale/crates/tui/src/tools/subagent/mod.rs|if \`handle_read\` is not in your tool list, activate it via \`tool_search\` first"
+  "T3|worker 记录共享 handle_read 激活提示 |CodeWhale/crates/tui/src/tools/subagent/mod.rs|if \`handle_read\` is not in your tool list, activate it via \`tool_search\` when available"
   "T3|worker 记录激活提示回归             |CodeWhale/crates/tui/src/tools/subagent/tests.rs|fn forkguard_worker_record_hints_teach_handle_read_activation"
   "T3|目标续轮直呼兜底                   |CodeWhale/crates/tui/src/prompts/text.rs|call \`update_goal\` directly anyway"
   "T3|父上下文提示直呼兜底                |CodeWhale/crates/tui/src/core/engine/context.rs|Use \`handle_read\` on \`transcript_handle\` for bounded transcript slices"

@@ -196,11 +196,11 @@ const EXPECTED_SURFACE = {
   // The replay result mutator is private and parameter-only. AST scope audit:
   // updateToolItem adds only that helper; replay adds it plus standard Map.
   // No new cluster deps, exports or forwarders; REQUIRED stays unchanged.
-  // isInternalUserMessage + isKnownInternalMetadataBlock read only the
-  // window.PinvouBridgeMessages classic global and their parameters, so no
-  // cluster literal gains a dep; userMessageDisplayText calls them as
-  // base-local declarations.
-  sharedFnCount: 315,
+  // Removed the unreferenced isKnownInternalMetadataBlock forwarder. It was
+  // neither exported nor called by any shared body, so no reachable cluster
+  // dependencies or REQUIRED entries change. isInternalUserMessage still
+  // reads only the classic global and its parameter.
+  sharedFnCount: 314,
 };
 
 assert.equal(

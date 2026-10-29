@@ -1,22 +1,5 @@
-//! 应用内升级（当前未实施）：各平台更新检查与安装均为 unsupported 占位——
-//! 检查、下载和安装均返回不支持；应用内更新能力规划中。
-//!
-//! 以下为历史设计（未实施，仅作背景保留）：
-//! - Linux：检查 latest.json → 下载 deb（sha256 校验）→ pkexec apt 安装 → 重启。
-//! - Windows：社区版首发暂不提供应用内更新，安装包由 GitHub Releases 分发。
-//!
-//! 设计要点（未实施）：
-//! - **更新源是静态 HTTP**：服务器只托管 `latest.json` + deb 文件，零服务端逻辑。
-//!   Tauri 官方 updater plugin 不支持 deb，所以这里自建轻量机制。
-//! - **URL 不进 settings.json**：更新源是基础设施不是用户偏好，可改会成攻击面。
-//!   `PINVOU3_UPDATE_URL` env 可覆盖（e2e 测试指本地 http server）。
-//! - **下载目录用 `~/.pinvou3/updates/`** 而非 /tmp：tmpfs 受内存限制且重启清空。
-//! - **安装走 pkexec**（弹系统密码框），与 super_permission.rs 同套路；但这里用
-//!   `.output()` 捕 stderr 透传 apt 真实报错（lock 占用 / 磁盘不足等）。
-//! - **inode 语义**：apt 替换 `/usr/bin/pinvou3` 后老进程持旧 inode 继续跑无害，
-//!   `app.restart()` 按路径 exec 才换到新版。所以装完不强制重启，前端给按钮。
+//! Manual stable Windows updates with backend-owned receipts.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -34,18 +17,11 @@ pub(crate) fn cleanup_stale_backup() {
     platform::cleanup_stale_backup();
 }
 
-/// 下载停滞看门狗阈值：连上后单次等待数据超过此时长即判定挂死。
-/// 用「单 chunk 间隔」而非「总耗时」做超时——慢网持续小流量不会被误杀，
-/// 只有真正长时间收不到任何字节（更新源挂起 / 半开连接）才中断。
-const DOWNLOAD_STALL_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// 下载取消标志。前端 `cancel_download` 置位，下载循环每轮检查一次。
-/// 进程级单例：同一时刻只允许一个下载在跑（前端 updateDownloading gate 保证）。
-static DOWNLOAD_CANCEL: AtomicBool = AtomicBool::new(false);
-
 /// check_for_update 的返回值；前端原样传回 download_update。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateInfo {
+    #[serde(default)]
+    pub selection_id: String,
     pub available: bool,
     pub current_version: String,
     pub latest_version: String,
@@ -96,8 +72,7 @@ pub fn get_app_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
 
-/// The community platform currently has no implemented update check. An
-/// unsupported result is not evidence that the installed version is current.
+/// Check the build-controlled feed on supported Windows builds.
 pub async fn check_for_update() -> Result<UpdateInfo, String> {
     let current = env!("CARGO_PKG_VERSION");
     platform::check_for_update_info(current)
@@ -105,17 +80,16 @@ pub async fn check_for_update() -> Result<UpdateInfo, String> {
         .inspect_err(|e| log::warn!("[updater] update check failed: {e}"))
 }
 
-/// Downloads the update package to `~/.pinvou3/updates/` with streaming
-/// writes and verification. No download-progress event is emitted to the
-/// frontend (the community download surface is a documented stub;
-/// `update:progress` has no consumer).
-pub async fn download_update(info: UpdateInfo, app: AppHandle) -> Result<(), String> {
-    platform::download_update_package(&info, app, &DOWNLOAD_CANCEL, DOWNLOAD_STALL_TIMEOUT)
-        .await
-        .inspect_err(|e| log::warn!("[updater] download failed: {e}"))
+/// Only the backend receipt authorizes install; this path is a transport hint.
+#[derive(Debug, Clone, Serialize)]
+pub struct DownloadedUpdate {
+    pub installer_path: String,
+}
+pub async fn download_update(info: UpdateInfo, app: AppHandle) -> Result<DownloadedUpdate, String> {
+    platform::download_update_package(&info, app).await
 }
 
-/// 安装下载好的更新包。Linux 走 pkexec apt；macOS 打开已校验的安装镜像。
+/// Verify and hand off the downloaded NSIS installer on a worker thread.
 pub async fn install_update(
     deb_path: Option<String>,
     installer_path: Option<String>,
@@ -128,22 +102,22 @@ pub async fn install_update(
     .await
     .map_err(|e| {
         log::warn!("[updater] install task failed: {e}");
-        format!("install task failed: {e}")
+        "UPDATER_INSTALL_FAILED".to_owned()
     })?
     .inspect_err(|e| log::warn!("[updater] install failed: {e}"))?;
     if exit_after_start {
+        crate::prepare_app_restart(&app).await;
         app.exit(0);
     }
     Ok(())
 }
 
-/// 置位取消标志，让正在跑的 `download_update` 循环下一轮自行退出并清理半成品。
-/// 仅对下载阶段有效；install 阶段(pkexec/apt)已交给系统，不在此中断。
+/// Cancel the actual domain download operation; native installation is separate.
 pub fn cancel_download() {
-    DOWNLOAD_CANCEL.store(true, Ordering::SeqCst);
+    platform::cancel_download();
 }
 
-/// 查询是否有待处理的升级结果；社区平台默认静默成功。
+/// Observe a local pending handoff without claiming server acknowledgement.
 pub async fn report_pending_update_result() -> Result<PendingUpdateReportResult, String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
@@ -155,14 +129,6 @@ pub async fn report_pending_update_result() -> Result<PendingUpdateReportResult,
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn unsupported_check_does_not_claim_the_installed_version_is_latest() {
-        assert_eq!(
-            check_for_update().await.unwrap_err(),
-            "UPDATER_CHECK_UNSUPPORTED"
-        );
-    }
 
     #[test]
     fn update_info_platforms_defaults_empty() {
@@ -179,6 +145,7 @@ mod tests {
         }"#;
         let info: UpdateInfo = serde_json::from_str(json).unwrap();
         assert!(info.platforms.is_empty());
+        assert!(info.selection_id.is_empty());
     }
 
     #[test]

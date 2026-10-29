@@ -1,5 +1,14 @@
 # Pinvou 对 CodeWhale 底座的 fork 维护策略
 
+## Integration status: 2026-10-29
+
+The Windows manual-update candidate pins public review commit
+f83e8cd84dc52977e0f0cd219d65a301c44f5d6e (PR 129), with 88 commits above v0.9.12.
+Public maintenance is f1eb10efcfe2468fde42d1724d7f5f19d54b904c; the candidate is
+not yet aligned with it. Section 6 authorization and the strict public-head
+gate remain in force. Immutable tags are unchanged. The 2026-10-26 numbers
+below are the historical integrated checkpoint, not the current candidate.
+
 > 最后更新：2026-10-26。公开维护头 6e1ee88ee 已包含 #118–#122；父仓 gitlink 与公开维护头对齐。
 > 配套：`docs/fork-modifications.md`、`scripts/fork-guard.sh`、`docs/底座升级验收清单.md`
 > English: [`docs/fork-policy.en.md`](fork-policy.en.md)
