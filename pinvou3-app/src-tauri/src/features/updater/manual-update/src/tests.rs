@@ -61,6 +61,19 @@ fn malformed_metadata_is_rejected() {
 }
 
 #[test]
+fn managed_download_must_stay_on_check_origin() {
+    let origin = Url::parse("https://updates.example.com/v1/updates/manual/check").unwrap();
+    assert!(same_origin(
+        &Url::parse("https://updates.example.com/v1/updates/manual/download/2.0.0").unwrap(),
+        &origin
+    ));
+    assert!(!same_origin(
+        &Url::parse("https://cdn.example.com/installer.exe").unwrap(),
+        &origin
+    ));
+}
+
+#[test]
 fn count_and_digest_bind_complete_download() {
     let bytes = b"installer";
     let digest: [u8; 32] = Sha256::digest(bytes).into();

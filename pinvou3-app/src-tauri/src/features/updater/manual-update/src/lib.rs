@@ -214,6 +214,9 @@ impl ManualUpdater {
         response = response
             .error_for_status()
             .map_err(|_| "UPDATER_CHECK_FAILED")?;
+        if !same_origin(response.url(), &self.check_url) {
+            return Err("UPDATER_METADATA_INVALID".into());
+        }
         if response
             .content_length()
             .is_some_and(|n| n > MANIFEST_LIMIT as u64)
@@ -300,12 +303,14 @@ impl ManualUpdater {
             .open(&partial)
             .await
             .map_err(|_| "UPDATER_CACHE_FAILED")?;
-        let mut response =
-            cancellable(&cancellation, self.client.get(selection.url.clone()).send())
-                .await?
-                .map_err(|_| "UPDATER_DOWNLOAD_FAILED")?
-                .error_for_status()
-                .map_err(|_| "UPDATER_DOWNLOAD_FAILED")?;
+        let mut response = cancellable(&cancellation, self.client.get(selection.url.clone()).send())
+            .await?
+            .map_err(|_| "UPDATER_DOWNLOAD_FAILED")?
+            .error_for_status()
+            .map_err(|_| "UPDATER_DOWNLOAD_FAILED")?;
+        if !same_origin(response.url(), &self.check_url) {
+            return Err("UPDATER_METADATA_INVALID".into());
+        }
         if response
             .content_length()
             .is_some_and(|n| n != selection.info.download_size)
@@ -433,6 +438,12 @@ fn https_url(value: &str) -> Result<Url, String> {
         return Err("UPDATER_METADATA_INVALID".into());
     }
     Ok(url)
+}
+
+fn same_origin(left: &Url, right: &Url) -> bool {
+    left.scheme() == right.scheme()
+        && left.host_str() == right.host_str()
+        && left.port_or_known_default() == right.port_or_known_default()
 }
 
 const DEVICE_ID_FILE: &str = "device-id";
