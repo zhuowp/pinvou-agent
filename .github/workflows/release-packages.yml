@@ -153,14 +153,6 @@ jobs:
           # header 凭据策略:运行时仓库公开,按锁定 gitlink 匿名拉取,不保留 job token(同 build-windows-x64)。
           persist-credentials: false
 
-      - name: Validate backend update origin
-        run: |
-          test -n "$PINVOU_MANUAL_UPDATE_CHECK_URL"
-          case "$PINVOU_MANUAL_UPDATE_CHECK_URL" in
-            https://*) ;;
-            *) echo "PINVOU_MANUAL_UPDATE_CHECK_URL must be HTTPS" >&2; exit 1 ;;
-          esac
-
       - name: Set up zram and swap
         # Best effort: timeouts or failures only warn and never block (falls back to stock runner memory).
         run: timeout --kill-after=15 240 sudo --preserve-env=GITHUB_ACTIONS,PINVOU3_CI_DISABLE_ZRAM bash "${{ github.workspace }}/scripts/ci-memory-setup.sh" || echo "::warning::ci-memory-setup did not finish; continuing with stock runner memory"
@@ -670,6 +662,15 @@ jobs:
           # 公开运行时由初始化脚本按锁文件精确拉取；不向跨仓库 submodule 传递 job token。
           submodules: false
           persist-credentials: false
+
+      - name: Validate backend update origin
+        shell: bash
+        run: |
+          test -n "$PINVOU_MANUAL_UPDATE_CHECK_URL"
+          case "$PINVOU_MANUAL_UPDATE_CHECK_URL" in
+            https://*) ;;
+            *) echo "PINVOU_MANUAL_UPDATE_CHECK_URL must be HTTPS" >&2; exit 1 ;;
+          esac
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
