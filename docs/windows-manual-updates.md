@@ -4,12 +4,18 @@ The first delivery supports Windows x64, Stable, a full NSIS installer, and an
 explicit user action for both download and installation. Other platforms and
 builds with an upgrade-host profile continue to report unsupported.
 
-The download source is controlled at build time by PINVOU3_UPDATE_URL. The
-Windows release build sets it to the current repository's HTTPS
-releases/latest/download/latest.json asset. Local builds without a configured
-feed report an unconfigured update source. Startup does not request that feed.
+The managed update check is controlled at build time by
+PINVOU_MANUAL_UPDATE_CHECK_URL. It must be an HTTPS endpoint such as
+`https://updates.example.com/v1/updates/manual/check`. The client sends the
+current stable version and a persisted, randomly generated 64-character
+lowercase hexadecimal device ID. The service returns `204 No Content` when no
+eligible update is assigned, or `200 OK` with the existing `latest.json` schema
+for the assigned Windows x64 NSIS artifact. A managed check failure is surfaced
+to the user and never falls back to another feed. Local builds without this
+backend URL report an unconfigured update source. Startup does not request it.
 
-This mode trusts the HTTPS release publisher and verifies the installer's exact
+The service response supplies the artifact download URL, exact size, and
+SHA-256; the client downloads that URL and verifies the installer's exact
 size and SHA-256. It does not implement the full protocol's signed metadata,
 trusted-time, Session authorization or installation-wide ownership. It must not
 be used to infer those permissions from ordinary JSON or process exit.
@@ -34,44 +40,19 @@ Users must finish background work before installation. Data-schema migrations,
 silent installation, forced updates and automatic cross-user termination are
 outside this delivery.
 
-## Build and publish the feed
+## Backend distribution
 
-The existing release-packages workflow produces the Windows NSIS installer,
-its SHA-256 sidecar and latest.json in the same Windows Actions artifact.
-An Actions artifact is not a public Release asset. The publisher must complete
-the following publication step before the compiled feed URL works.
+The operator uploads the reviewed Windows x64 NSIS installer through the update
+management backend. The backend verifies the product version, exact size and
+SHA-256, stores the immutable bytes, and serves the update check and download
+routes. Clients do not request GitHub or another public release feed.
 
-Download that Windows artifact to a local directory. Publish only a reviewed
-source version with a new, matching stable tag. The tag must already point to
-the installer build's source commit; do not reuse or move a historical tag.
-The following commands deliberately require that existing tag:
+Configure `PINVOU_MANUAL_UPDATE_CHECK_URL` at build time with the backend check
+endpoint, for example `https://updates.example.com/v1/updates/manual/check`.
+The response contains the backend artifact URL, exact size and SHA-256. The
+client checks those bindings again while downloading and before native launch.
+A `204 No Content` response means this installation is not currently selected.
 
-~~~powershell
-$repo = 'OWNER/REPOSITORY'
-$version = 'NEW.STABLE.VERSION'
-$installer = "pinvou-agent_$version-windows-x64-setup.exe"
-$feed = Get-Content -LiteralPath latest.json -Raw | ConvertFrom-Json
-$asset = $feed.platforms.'windows-x64'
-if ($feed.latest_version -ne $version -or $asset.version -ne $version) { throw 'Version mismatch' }
-if ($asset.format -ne 'nsis') { throw 'Wrong installer format' }
-if ($asset.url -ne "https://github.com/$repo/releases/download/v$version/$installer") { throw 'Wrong release URL' }
-if ((Get-Item -LiteralPath $installer).Length -ne $asset.size) { throw 'Size mismatch' }
-if ((Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant() -ne $asset.sha256) { throw 'SHA256 mismatch' }
-gh release create "v$version" $installer "$installer.sha256" latest.json --repo $repo --verify-tag --latest --title "Pinvou $version" --notes "Windows x64 manual update"
-if ($LASTEXITCODE -ne 0) { throw 'Release publication failed' }
-~~~
-
-This last command publishes the release. For preparation and review, add
---draft and remove --latest; draft assets cannot serve the public update feed.
-Do not report the feed as deployed until latest.json and the selected installer
-are actually available from the configured HTTPS URLs.
-
-For a locally built, canonically named installer, generate matching metadata with:
-
-~~~text
-node scripts/build-windows-update-manifest.mjs --installer PATH --repository OWNER/REPOSITORY --output latest.json
-~~~
-
-The generator reads VERSION, checks the filename and PE executable header, hashes
-the actual bytes, and refuses to overwrite an existing output. Its unit fixture
-is synthetic and does not certify a working installer.
+A release remains unavailable until an operator has uploaded and the backend has
+verified it, then started or resumed its rollout. Pausing affects later checks;
+it does not revoke an already downloaded installer.

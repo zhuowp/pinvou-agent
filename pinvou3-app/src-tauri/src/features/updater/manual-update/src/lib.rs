@@ -120,7 +120,8 @@ struct Cancellation {
 /// Backend owns selection and download receipts. UI fields never supply authority.
 pub struct ManualUpdater {
     client: Client,
-    feed_url: Url,
+    check_url: Url,
+    device_id: String,
     cache_root: PathBuf,
     state: Arc<Mutex<State>>,
 }
@@ -151,8 +152,9 @@ impl Drop for OwnedDownloadDir {
 }
 
 impl ManualUpdater {
-    pub fn new(feed_url: &str, cache_root: PathBuf) -> Result<Self, String> {
-        let feed_url = https_url(feed_url)?;
+    pub fn new(check_url: &str, cache_root: PathBuf) -> Result<Self, String> {
+        let check_url = https_url(check_url)?;
+        let device_id = load_or_create_device_id(&cache_root)?;
         let client = Client::builder()
             .https_only(true)
             .connect_timeout(Duration::from_secs(10))
@@ -168,7 +170,8 @@ impl ManualUpdater {
             .map_err(|_| "UPDATER_INTERNAL".to_string())?;
         Ok(Self {
             client,
-            feed_url,
+            check_url,
+            device_id,
             cache_root,
             state: Arc::new(Mutex::new(State::default())),
         })
@@ -188,12 +191,27 @@ impl ManualUpdater {
         stable_version(current_version)?;
         // A failed new check cannot leave an older selection installable.
         self.clear_selection();
+        let check_url = check_request_url(&self.check_url, &self.device_id, current_version);
         let mut response = self
             .client
-            .get(self.feed_url.clone())
+            .get(check_url)
             .send()
             .await
-            .map_err(|_| "UPDATER_CHECK_FAILED")?
+            .map_err(|_| "UPDATER_CHECK_FAILED")?;
+        if response.status() == reqwest::StatusCode::NO_CONTENT {
+            let info = CheckedUpdate {
+                selection_id: uuid::Uuid::new_v4().to_string(),
+                version: current_version.to_owned(),
+                notes: None,
+                pub_date: None,
+                download_size: 0,
+                url: String::new(),
+                sha256: String::new(),
+                available: false,
+            };
+            return Ok(info);
+        }
+        response = response
             .error_for_status()
             .map_err(|_| "UPDATER_CHECK_FAILED")?;
         if response
@@ -415,6 +433,43 @@ fn https_url(value: &str) -> Result<Url, String> {
         return Err("UPDATER_METADATA_INVALID".into());
     }
     Ok(url)
+}
+
+const DEVICE_ID_FILE: &str = "device-id";
+
+fn check_request_url(base: &Url, device_id: &str, current_version: &str) -> Url {
+    let mut url = base.clone();
+    url.query_pairs_mut()
+        .append_pair("deviceId", device_id)
+        .append_pair("currentVersion", current_version);
+    url
+}
+
+fn load_or_create_device_id(cache_root: &Path) -> Result<String, String> {
+    let storage_root = cache_root.parent().unwrap_or(cache_root);
+    fs::create_dir_all(storage_root).map_err(|_| "UPDATER_CACHE_FAILED")?;
+    let path = storage_root.join(DEVICE_ID_FILE);
+    if let Ok(value) = fs::read_to_string(&path) {
+        let value = value.trim();
+        if value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Ok(value.to_owned());
+        }
+    }
+    let mut value = String::with_capacity(64);
+    for byte in uuid::Uuid::new_v4()
+        .as_bytes()
+        .iter()
+        .chain(uuid::Uuid::new_v4().as_bytes().iter())
+    {
+        use std::fmt::Write as _;
+        write!(&mut value, "{byte:02x}").map_err(|_| "UPDATER_INTERNAL")?;
+    }
+    fs::write(&path, &value).map_err(|_| "UPDATER_CACHE_FAILED")?;
+    Ok(value)
 }
 
 fn parse_feed(bytes: &[u8], current_version: &str) -> Result<Selection, String> {
