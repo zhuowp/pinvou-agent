@@ -153,6 +153,14 @@ jobs:
           # header 凭据策略:运行时仓库公开,按锁定 gitlink 匿名拉取,不保留 job token(同 build-windows-x64)。
           persist-credentials: false
 
+      - name: Validate backend update origin
+        run: |
+          test -n "$PINVOU_MANUAL_UPDATE_CHECK_URL"
+          case "$PINVOU_MANUAL_UPDATE_CHECK_URL" in
+            https://*) ;;
+            *) echo "PINVOU_MANUAL_UPDATE_CHECK_URL must be HTTPS" >&2; exit 1 ;;
+          esac
+
       - name: Set up zram and swap
         # Best effort: timeouts or failures only warn and never block (falls back to stock runner memory).
         run: timeout --kill-after=15 240 sudo --preserve-env=GITHUB_ACTIONS,PINVOU3_CI_DISABLE_ZRAM bash "${{ github.workspace }}/scripts/ci-memory-setup.sh" || echo "::warning::ci-memory-setup did not finish; continuing with stock runner memory"
@@ -650,7 +658,7 @@ jobs:
       # 用预生成 NASM 对象规避(同 pr-check.yml windows-rust-test 的结论)。
       # 当前 Windows 默认发布目标仅 x86_64。
       AWS_LC_SYS_PREBUILT_NASM: "1"
-      PINVOU3_UPDATE_URL: https://github.com/${{ github.repository }}/releases/latest/download/latest.json
+      PINVOU_MANUAL_UPDATE_CHECK_URL: ${{ vars.PINVOU_MANUAL_UPDATE_CHECK_URL }}
       # release 编译 codewhale-tui 的 SIGBUS 同源风险防护(三端统一注入;
       # Windows 用 .exe 版 wrapper(本 job 先编译):.cmd 经 cmd /C 受 8191 字符
       # 命令行上限限制,windows-sys 等大型 crate 的 rustc 命令行会超限)。
@@ -782,12 +790,6 @@ jobs:
           echo "$SHA  $EXE" > "$EXE.sha256"
           ls -lh "$EXE"
 
-      - name: Build Windows manual-update feed
-        run: >-
-          node scripts/build-windows-update-manifest.mjs
-          --installer "pinvou3-app/src-tauri/target/release/bundle/nsis/pinvou-agent_${VERSION}-windows-x64-setup.exe"
-          --output "pinvou3-app/src-tauri/target/release/bundle/nsis/latest.json"
-
       - name: 上传 nsis artifact
         uses: actions/upload-artifact@v7
         with:
@@ -795,7 +797,6 @@ jobs:
           path: |
             pinvou3-app/src-tauri/target/release/bundle/nsis/pinvou-agent_${{ needs.check-version-bump.outputs.version }}-windows-x64-setup.exe
             pinvou3-app/src-tauri/target/release/bundle/nsis/pinvou-agent_${{ needs.check-version-bump.outputs.version }}-windows-x64-setup.exe.sha256
-            pinvou3-app/src-tauri/target/release/bundle/nsis/latest.json
           retention-days: 90
           if-no-files-found: error
 
