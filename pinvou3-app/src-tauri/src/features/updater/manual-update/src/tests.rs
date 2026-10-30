@@ -61,6 +61,19 @@ fn malformed_metadata_is_rejected() {
 }
 
 #[test]
+fn managed_download_must_stay_on_check_origin() {
+    let origin = Url::parse("https://updates.example.com/v1/updates/manual/check").unwrap();
+    assert!(same_origin(
+        &Url::parse("https://updates.example.com/v1/updates/manual/download/2.0.0").unwrap(),
+        &origin
+    ));
+    assert!(!same_origin(
+        &Url::parse("https://cdn.example.com/installer.exe").unwrap(),
+        &origin
+    ));
+}
+
+#[test]
 fn count_and_digest_bind_complete_download() {
     let bytes = b"installer";
     let digest: [u8; 32] = Sha256::digest(bytes).into();
@@ -84,6 +97,45 @@ pub(crate) fn updater() -> ManualUpdater {
         std::env::temp_dir().join(uuid::Uuid::new_v4().to_string()),
     )
     .unwrap()
+}
+
+#[test]
+fn device_id_is_stable_lower_hex_and_recreated_when_corrupt() {
+    let root = std::env::temp_dir().join(format!("pinvou-device-id-{}", uuid::Uuid::new_v4()));
+    let cache = root.join("cache");
+    fs::create_dir_all(&root).unwrap();
+    let first = load_or_create_device_id(&cache).unwrap();
+    assert_eq!(first.len(), 64);
+    assert!(
+        first
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    );
+    assert_eq!(first, load_or_create_device_id(&cache).unwrap());
+    fs::write(root.join(DEVICE_ID_FILE), "not-a-device-id").unwrap();
+    let replacement = load_or_create_device_id(&cache).unwrap();
+    assert_eq!(replacement.len(), 64);
+    assert_ne!(replacement, "not-a-device-id");
+    assert_eq!(replacement, load_or_create_device_id(&cache).unwrap());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn managed_check_query_binds_device_and_current_version() {
+    let url =
+        Url::parse("https://updates.example/v1/updates/manual/check?tenant=community").unwrap();
+    let device = "a".repeat(64);
+    let request = check_request_url(&url, &device, "1.2.3");
+    let pairs: std::collections::HashMap<_, _> = request.query_pairs().into_owned().collect();
+    assert_eq!(pairs.get("tenant").map(String::as_str), Some("community"));
+    assert_eq!(
+        pairs.get("deviceId").map(String::as_str),
+        Some(device.as_str())
+    );
+    assert_eq!(
+        pairs.get("currentVersion").map(String::as_str),
+        Some("1.2.3")
+    );
 }
 
 #[tokio::test]

@@ -21,11 +21,11 @@ static UPDATER: OnceLock<Result<ManualUpdater, String>> = OnceLock::new();
 fn updater() -> Result<&'static ManualUpdater, String> {
     UPDATER
         .get_or_init(|| {
-            let feed = option_env!("PINVOU3_UPDATE_URL")
+            let check_url = option_env!("PINVOU_MANUAL_UPDATE_CHECK_URL")
                 .filter(|v| !v.is_empty())
                 .ok_or("UPDATER_CHECK_UNCONFIGURED")?;
             ManualUpdater::new(
-                feed,
+                check_url,
                 crate::platform::paths::pinvou3_home().join("updates/manual"),
             )
         })
